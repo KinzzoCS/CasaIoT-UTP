@@ -1,0 +1,140 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────
+#  CasaIoT — Docker Compose
+#  Servicios: broker (Mosquitto), db (PostgreSQL),
+#             backend (Node.js), frontend (Next.js)
+# ─────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Broker MQTT ─────────────────────────────────────────────
+  broker:
+    image: eclipse-mosquitto:2.0
+    container_name: casaiot_broker
+    restart: unless-stopped
+    ports:
+      - "8883:8883"    # MQTT sobre TLS (ESP32 y clientes externos LAN)
+      # Puerto 1883 (plain) NO expuesto intencionalmente
+    volumes:
+      - ./broker/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./broker/passwd:/mosquitto/config/passwd:ro
+      - ./broker/certs:/mosquitto/certs:ro
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+    networks:
+      - iot_internal
+    healthcheck:
+      test: ["CMD", "mosquitto_pub", "-h", "localhost", "-p", "1883", "-t", "health", "-m", "ping", "--cafile", "/mosquitto/certs/ca.crt"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Base de datos ────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: casaiot_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-casaiot}
+      POSTGRES_USER: ${POSTGRES_USER:-casaiot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?DB password required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - iot_internal
+    # NO expone puerto al host por seguridad — solo backend puede acceder
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-casaiot} -d ${POSTGRES_DB:-casaiot}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Backend API + WebSocket ──────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: casaiot_backend
+    restart: unless-stopped
+    ports:
+      - "3001:3001"    # API REST + WebSocket
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: 3001
+      # Database
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-casaiot}
+      # JWT
+      JWT_SECRET: ${JWT_SECRET:?JWT secret required}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT refresh secret required}
+      # MQTT
+      MQTT_BROKER_URL: mqtt://broker:1883
+      MQTT_USERNAME: ${MQTT_BACKEND_USER:-backend}
+      MQTT_PASSWORD: ${MQTT_BACKEND_PASSWORD:?MQTT backend password required}
+      MQTT_CA_PATH: /app/certs/ca.crt
+      MQTT_CERT_PATH: /app/certs/backend.crt
+      MQTT_KEY_PATH: /app/certs/backend.key
+      # App
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
+    volumes:
+      - ./broker/certs:/app/certs:ro
+      - ./firmware:/app/firmware:ro
+      - backend_logs:/app/logs
+    depends_on:
+      db:
+        condition: service_healthy
+      broker:
+        condition: service_started
+    networks:
+      - iot_internal
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3001/health', r => process.exit(r.statusCode === 200 ? 0 : 1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Frontend Next.js ─────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_WIFI_SSID: ${NEXT_PUBLIC_WIFI_SSID:-TuSSID}
+        NEXT_PUBLIC_MQTT_BROKER: ${NEXT_PUBLIC_MQTT_BROKER:-192.168.1.100}
+    container_name: casaiot_frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"    # UI Web
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3001}
+      NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://localhost:3001}
+      NEXT_PUBLIC_WIFI_SSID: ${NEXT_PUBLIC_WIFI_SSID:-TuSSID}
+      NEXT_PUBLIC_MQTT_BROKER: ${NEXT_PUBLIC_MQTT_BROKER:-172.16.200.48}
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - iot_internal
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000', r => process.exit(r.statusCode === 200 ? 0 : 1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+# ── Volúmenes persistentes ───────────────────────────────────
+volumes:
+  postgres_data:
+    name: casaiot_postgres_data
+  mosquitto_data:
+    name: casaiot_mosquitto_data
+  mosquitto_log:
+    name: casaiot_mosquitto_log
+  backend_logs:
+    name: casaiot_backend_logs
+
+# ── Redes ────────────────────────────────────────────────────
+networks:
+  iot_internal:
+    name: casaiot_internal
+    driver: bridge
+    # Red interna aislada — los servicios se comunican por nombre de contenedor

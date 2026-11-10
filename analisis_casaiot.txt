@@ -1,0 +1,659 @@
+================================================================================
+                   ANÁLISIS DE ARQUITECTURA DE SOFTWARE
+                         CasaIoT v1.0.0
+================================================================================
+
+                            Julio 2026
+
+================================================================================
+                       1. RESUMEN EJECUTIVO
+================================================================================
+
+CasaIoT es una plataforma de domótica integral de código abierto diseñada para
+ejecución completamente local, sin dependencia de servicios en la nube. El
+proyecto permite la gestión, monitoreo y control de dispositivos IoT basados en
+microcontroladores ESP32 a través de una interfaz web moderna, un backend de
+API REST, comunicación bidireccional en tiempo real mediante WebSocket y MQTT,
+y un sistema de automatización basado en cronogramas.
+
+El stack tecnológico se compone de Node.js con Express para el backend,
+Next.js 14 para el frontend, PostgreSQL 16 como motor de base de datos, y
+Eclipse Mosquitto como broker MQTT. El firmware de los dispositivos se
+desarrolla en C++ sobre el framework Arduino para ESP32. La infraestructura
+está completamente containerizada mediante Docker Compose, facilitando el
+despliegue en entornos de producción.
+
+El presente documento describe la arquitectura de software, las normativas
+aplicadas, las medidas de seguridad implementadas, y los componentes
+fundamentales del sistema, con el objetivo de proporcionar una visión integral
+de su diseño y operación.
+
+
+================================================================================
+                   2. ARQUITECTURA DEL SOFTWARE
+================================================================================
+
+2.1 Arquitectura General
+
+El sistema sigue un modelo de arquitectura por capas (Layered Architecture)
+con cuatro niveles principales:
+
+  +------------------------------------------------------------------+
+  |                    CAPA DE PRESENTACIÓN                          |
+  |              Frontend (Next.js 14 - Puerto 3000)                 |
+  |      Aplicación web de una sola página (SPA) con diseño          |
+  |      glassmorphism (estilo "Nothing"). Interfaz responsiva       |
+  |      con soporte PWA (Progressive Web App).                      |
+  +------------------------------------------------------------------+
+  |                    CAPA DE APLICACIÓN                            |
+  |            Backend (Node.js + Express - Puerto 3001)             |
+  |  +-------------+  +-------------+  +----------+  +----------+    |
+  |  | REST API    |  | WebSocket   |  | Cliente  |  | Cron     |    |
+  |  | (Express)   |  | Gateway     |  | MQTT     |  | Scheduler|   |
+  |  +-------------+  +-------------+  +----------+  +----------+    |
+  +------------------------------------------------------------------+
+  |                    CAPA DE SERVICIOS                              |
+  |  +---------------------------+  +----------------------------+    |
+  |  | PostgreSQL 16 Alpine      |  | Eclipse Mosquitto 2.0      |    |
+  |  | (Persistencia relacional) |  | (Broker de mensajería MQTT)|    |
+  |  +---------------------------+  +----------------------------+    |
+  +------------------------------------------------------------------+
+  |                    CAPA DE DISPOSITIVOS                           |
+  |  ESP32 con firmware Arduino (6 tipos de dispositivo)             |
+  |  Comunicación: MQTT sobre TLS (puerto 8883)                      |
+  +------------------------------------------------------------------+
+
+2.2 Patrones de Diseño
+
+El sistema implementa los siguientes patrones de diseño:
+
+  - Layered Architecture (Arquitectura por Capas): Separación clara entre
+    frontend, backend, servicios y dispositivos.
+
+  - Gateway Pattern: El WebSocket gateway actúa como puente bidireccional
+    entre el frontend y el broker MQTT, traduciendo mensajes entre ambos
+    protocolos.
+
+  - Observer Pattern: Los manejadores de MQTT se registran como observadores
+    de tópicos específicos; los clientes WebSocket reciben notificaciones de
+    eventos en tiempo real.
+
+  - Singleton Pattern: El cliente MQTT, el gateway WebSocket y el pool de
+    conexiones a PostgreSQL se implementan como singletons.
+
+  - Middleware Chain: El stack de Express emplea una cadena de middleware
+    secuencial: helmet, CORS, parseo JSON, rate limiting, autenticación JWT
+    y enrutamiento.
+
+  - Repository Pattern: El acceso a datos se realiza mediante consultas SQL
+    directas a través del pool de pg, sin utilizar un ORM.
+
+  - Strategy Pattern: Cada tipo de dispositivo posee validación de comandos
+    y generación de firmware específica.
+
+  - Pub/Sub: Se emplea MQTT como mecanismo de publicación/suscripción para
+    la comunicación con dispositivos IoT, y WebSocket para la difusión de
+    eventos al frontend.
+
+2.3 Flujos de Comunicación
+
+  a) Flujo de consultas (Frontend -> Backend -> Base de datos):
+     El frontend realiza peticiones HTTP REST al backend, que procesa la
+     solicitud, ejecuta consultas parametrizadas contra PostgreSQL y retorna
+     la respuesta correspondiente.
+
+  b) Flujo de telemetría (Dispositivo -> Broker -> Backend -> Frontend):
+     Los dispositivos ESP32 publican datos (estado, sensores, telemetría) en
+     tópicos MQTT. El backend, suscrito a estos tópicos a través del cliente
+     MQTT, procesa los mensajes y los difunde a los clientes WebSocket
+     conectados.
+
+  c) Flujo de comandos (Frontend -> Backend -> Broker -> Dispositivo):
+     El frontend envía comandos a través de WebSocket o HTTP REST. El backend
+     publica la instrucción en el tópico MQTT correspondiente, y el
+     dispositivo ESP32, suscrito a dicho tópico, ejecuta la acción.
+
+  d) Flujo de automatización (Backend -> Broker -> Dispositivo):
+     El scheduler basado en node-cron ejecuta acciones programadas según
+     expresiones cron almacenadas en la base de datos, publicando comandos
+     MQTT en los momentos programados.
+
+2.4 Secuencia de Arranque (Backend)
+
+  1. Carga y validación de variables de entorno.
+  2. Inicialización del pool de conexiones PostgreSQL.
+  3. Creación del servidor HTTP con Express.
+  4. Inicialización del gateway WebSocket.
+  5. Conexión del cliente MQTT al broker Mosquitto.
+  6. Registro de manejadores de mensajes MQTT por tópico.
+  7. Programación de tareas periódicas (detección de dispositivos
+     inactivos cada 15 segundos).
+  8. Inicio del heartbeat WebSocket (intervalo de 30 segundos).
+  9. Inicio del servidor HTTP en el puerto configurado.
+  10. Registro de manejadores de terminación graceful (SIGTERM, SIGINT).
+
+
+================================================================================
+                   3. STACK TECNOLÓGICO
+================================================================================
+
+  +------------------------+---------------------+-------------------------+
+  | Componente             | Tecnología          | Versión                 |
+  +------------------------+---------------------+-------------------------+
+  | Backend                | Node.js             | >= 20                   |
+  | Framework backend      | Express             | 4.19.2                  |
+  | Cliente MQTT           | MQTT.js             | 5.7.3                   |
+  | WebSocket              | ws                  | 8.18.0                  |
+  | Programador de tareas  | node-cron           | 3.0.3                   |
+  | Autenticación JWT      | jsonwebtoken        | 9.0.2                   |
+  | Hash de contraseñas    | bcrypt              | 5.1.1                   |
+  | Cliente PostgreSQL     | pg                  | 8.12.0                  |
+  | Seguridad HTTP         | helmet              | 7.1.0                   |
+  | Limitación de tasa     | express-rate-limit  | 7.3.1                   |
+  | Generación de UUID     | uuid                | 10.0.0                  |
+  +------------------------+---------------------+-------------------------+
+  | Frontend               | Next.js             | 14.2.5                  |
+  | Librería UI            | React               | 18.3.1                  |
+  | Iconos                 | lucide-react        | 0.360.0                 |
+  +------------------------+---------------------+-------------------------+
+  | Base de datos          | PostgreSQL Alpine   | 16                      |
+  | Broker MQTT            | Eclipse Mosquitto   | 2.0                     |
+  | Firmware IoT           | Arduino Core ESP32  | -                       |
+  | Librería MQTT (ESP32)  | PubSubClient        | -                       |
+  | JSON (ESP32)           | ArduinoJson         | -                       |
+  +------------------------+---------------------+-------------------------+
+
+
+================================================================================
+                   4. NORMATIVAS APLICADAS
+================================================================================
+
+4.1 Estándares de Comunicación IoT
+
+  - MQTT 3.1.1: Protocolo de mensajería publish/subscribe empleado para la
+    comunicación con dispositivos IoT, implementado mediante Eclipse Mosquitto
+    (broker) y PubSubClient (firmware ESP32).
+
+  - WebSocket (RFC 6455): Protocolo de comunicación bidireccional en tiempo
+    real utilizado para la actualización del frontend desde el backend.
+
+  - HTTP/1.1: Protocolo de la capa de aplicación para la API REST.
+
+  - TCP/IP: Protocolo subyacente para todas las comunicaciones de red.
+
+4.2 Estándares de Seguridad
+
+  - TLS 1.2: Protocolo de seguridad para la capa de transporte, configurado
+    en Mosquitto para el puerto 8883 (MQTT sobre TLS).
+
+  - bcrypt (NIST SP 800-63B): Algoritmo de hash para contraseñas con 12
+    rondas de sal, conforme a las recomendaciones del NIST para
+    almacenamiento seguro de credenciales.
+
+  - SHA-256 (FIPS 180-4): Algoritmo de hash utilizado para el
+    almacenamiento de tokens de API y refresh tokens.
+
+  - JWT (RFC 7519): Estándar para tokens de acceso autónomos (stateless),
+    implementado con jsonwebtoken.
+
+  - UUID v4 (RFC 4122): Identificadores universalmente únicos para la
+    identificación de dispositivos.
+
+4.3 Licenciamiento
+
+  - El proyecto se distribuye bajo licencia MIT, permitiendo su uso,
+    modificación y distribución libre, sujeto a la inclusión del aviso de
+    copyright correspondiente.
+
+4.4 Protección de Datos
+
+  - El sistema opera completamente en local (on-premise), sin dependencia de
+    servicios en la nube, lo que elimina los riesgos de transferencia de
+    datos a terceros.
+
+  - Las contraseñas de usuario nunca se almacenan en texto plano.
+
+
+================================================================================
+                   5. MEDIDAS DE SEGURIDAD
+================================================================================
+
+5.1 Infraestructura PKI / TLS
+
+  - Se implementa una infraestructura de clave pública (PKI) local con
+    autoridad certificadora (CA) propia.
+
+  - Certificados generados mediante scripts automatizados en PowerShell:
+    * CA (RSA 4096 bits)
+    * Certificado de servidor para Mosquitto (RSA 2048 bits, SANs para
+      localhost, broker e IP)
+    * Certificado de cliente para el backend (RSA 2048 bits)
+    * Certificados de cliente por dispositivo (mTLS) para autenticación
+      mutua de dispositivos IoT (generación individual mediante script)
+
+  - Mosquitto configura dos listeners:
+    * Puerto 1883: Sin TLS, restringido a la red interna de Docker
+      (solo para desarrollo)
+    * Puerto 8883: TLS con certificados CA, servidor y clave privada
+
+  - El firmware base de ESP32 incluye el certificado CA para establecer
+    conexiones TLS seguras con el broker.
+
+5.2 Autenticación
+
+  - JWT (JSON Web Token) para autenticación stateless:
+    * Access token con expiración de 15 minutos
+    * Refresh token con expiración de 7 días, almacenado como hash SHA-256
+      en base de datos
+
+  - API tokens para integraciones y dispositivos:
+    * Prefijo "casaiot_" para identificación
+    * Hash SHA-256 almacenado en base de datos
+    * Token mostrado una única vez en la creación
+    * Revocables y con expiración configurable
+
+  - Hash de contraseñas con bcrypt (12 rondas):
+    * Protección contra ataques de fuerza bruta
+    * Incluye sal automática
+
+  - Protección contra timing attacks:
+    * Comparación dummy de bcrypt incluso cuando el usuario no existe
+
+  - Autenticación WebSocket:
+    * Verificación JWT durante el handshake mediante query parameter
+      o cabecera Authorization
+
+5.3 Autorización
+
+  - Esquema de roles definido en base de datos (admin, user, readonly)
+  - Actualmente deshabilitado para la mayoría de endpoints (solo endpoints
+    /api/admin/* requieren rol admin)
+  - Pendiente de reimplementación completa (documentado en
+    PERMISOS_REMOVIDOS.md)
+
+5.4 Seguridad HTTP (Backend)
+
+  - Helmet: Middleware que configura cabeceras de seguridad HTTP:
+    CSP (Content Security Policy), HSTS (HTTP Strict Transport Security),
+    protección contra XSS, etc.
+
+  - CORS: Validación basada en lista blanca de orígenes permitidos
+
+  - Rate Limiting (express-rate-limit):
+    * AuthLimiter: aplicado a endpoints de autenticación
+    * ApiLimiter: aplicado a endpoints de API
+    * Nota: Los límites actuales están configurados con valores muy altos,
+      lo que efectivamente deshabilita la funcionalidad en desarrollo
+
+  - Límite de tamaño del cuerpo HTTP (body-parser): 10KB para prevenir
+    ataques de denegación de servicio (DoS) por cuerpo de petición grande
+
+5.5 Seguridad HTTP (Frontend)
+
+  - Cabeceras de seguridad configuradas en next.config.js:
+    * X-Frame-Options: DENY (previene clickjacking)
+    * X-Content-Type-Options: nosniff (previene MIME sniffing)
+    * Referrer-Policy: strict-origin-when-cross-origin
+    * Permissions-Policy: solo micrófono habilitado (necesario para
+      funcionalidad Push-to-Talk)
+    * poweredByHeader: false (oculta que el servidor es Next.js)
+
+5.6 Validación y Sanitización de Entradas
+
+  - Funciones de validación en utils/validation.js:
+    * sanitizeString(): Elimina caracteres < y >, limita longitud
+    * isValidUsername(): Validación de formato de usuario
+    * isStrongPassword(): Validación de fortaleza de contraseña
+    * isValidUUID(): Validación de formato UUID
+    * isValidEmail(): Validación de formato de correo electrónico
+    * isIntInRange(): Validación de rangos numéricos
+    * isValidCronExpression(): Validación de expresiones cron
+
+  - Consultas SQL parametrizadas: Todas las consultas a PostgreSQL utilizan
+    parámetros, previniendo ataques de inyección SQL.
+
+  - Protección contra path traversal en generación de firmware.
+
+5.7 Seguridad Operacional
+
+  - Contenedores Docker ejecutados con usuario no-root (UID 1001,
+    usuario "casaiot")
+
+  - Archivos .dockerignore que previenen la inclusión de secretos y
+    archivos innecesarios en las imágenes
+
+  - Manejadores de terminación graceful (SIGTERM, SIGINT) para cierre
+    ordenado de conexiones
+
+  - Manejadores de excepciones no capturadas
+
+  - Secretos almacenados exclusivamente en variables de entorno (nunca
+    en código fuente)
+
+  - .gitignore apropiado para evitar commits de secretos y archivos
+    generados
+
+
+================================================================================
+                   6. BASE DE DATOS Y PERSISTENCIA
+================================================================================
+
+6.1 Motor de Base de Datos
+
+  - PostgreSQL 16 Alpine: Motor de base de datos relacional escogido por
+    su madurez, rendimiento, soporte de tipos JSONB, y eficiencia en
+    contenedores.
+
+6.2 Esquema de Tablas
+
+  El sistema define las siguientes tablas principales:
+
+  a) devices: Dispositivos IoT registrados
+     - ID: UUID (uuid_generate_v4) para unicidad global
+     - Campos: name, type, location, mqtt_client_id (único),
+       mqtt_topic_base, is_online, last_state (JSONB), last_seen,
+       firmware_version, deleted_at (soft delete), created_at
+
+  b) events: Historial de eventos (potencialmente alto volumen)
+     - ID: BIGSERIAL optimizado para inserciones de alta frecuencia
+     - Campos: device_id (FK), event_type, payload (JSONB), source_ip
+       (INET), created_at
+
+  c) schedules: Automatizaciones basadas en cron
+     - Campos: device_id (FK con CASCADE), name, cron_expression,
+       action (JSONB), is_active, next_run, last_run, created_at
+
+  d) users: Usuarios del sistema
+     - Campos: username (único), password_hash (bcrypt), role
+       (admin/user/readonly), email, is_active, last_login, created_at
+
+  e) api_tokens: Tokens de API para integraciones
+     - Campos: user_id (FK con CASCADE), token_hash (SHA-256, único),
+       name, last_used, expires_at, created_at
+
+  f) refresh_tokens: Tokens de actualización JWT
+     - Campos: user_id (FK con CASCADE), token_hash (SHA-256, único),
+       revoked, expires_at, created_at
+
+  g) reminders: Recordatorios de mantenimiento
+     - Campos: title, description, reminder_type (battery, firmware,
+       maintenance, custom), device_id (FK), due_date, is_dismissed,
+       created_at
+
+  h) system_config: Configuración clave-valor
+     - Key: VARCHAR(100) PK
+     - Value: JSONB
+
+  i) _migrations: Control de versiones del esquema
+     - Campos: filename (único), applied_at
+
+6.3 Decisiones de Diseño
+
+  - UUID para dispositivos: Unicidad global, sin preocupaciones de
+    colisión en entornos distribuidos.
+
+  - BIGSERIAL para eventos: Optimizado para inserciones de alta
+    frecuencia en tablas de auditoría.
+
+  - JSONB para payloads: Flexibilidad en el almacenamiento de datos
+    variables sin necesidad de esquema rígido, con capacidad de
+    indexación.
+
+  - TIMESTAMPTZ (timestamp with time zone): Almacenamiento consistente
+    de marcas temporales independientemente de la zona horaria del
+    servidor.
+
+  - Soft delete (deleted_at) en dispositivos: Permite auditoría y
+    recuperación ante eliminaciones accidentales.
+
+  - Índices sugeridos en columnas de filtrado frecuente (device_id,
+    event_type, created_at, etc.).
+
+  - Particionamiento sugerido para la tabla events al superar el
+    millón de registros.
+
+6.4 Migraciones
+
+  - El sistema implementa un sistema propio de migraciones SQL
+    secuenciales (001_initial_schema.sql, 002_insert_default_admin.sql).
+
+  - La tabla _migrations registra las migraciones aplicadas para evitar
+    ejecuciones duplicadas.
+
+  - Las migraciones se ejecutan mediante el script db/migrate.js.
+
+
+================================================================================
+                   7. COMPONENTES IoT
+================================================================================
+
+7.1 Estructura de Tópicos MQTT
+
+  El sistema define una jerarquía de tópicos MQTT bajo el namespace
+  "casa/":
+
+    casa/dispositivo/{device_id}/
+      ├── estado        (dispositivo -> broker: actualizaciones de estado)
+      ├── comando       (broker -> dispositivo: instrucciones)
+      ├── sensor        (dispositivo -> broker: lecturas de sensores)
+      ├── telemetria    (dispositivo -> broker: RSSI, heap, uptime)
+      └── ota           (broker -> dispositivo: actualizaciones OTA futuras)
+
+    casa/sistema/
+      └── backend-status (heartbeat del backend: online/offline)
+
+7.2 Protocolo de Comunicación
+
+  - Estado (estado): Los dispositivos publican cambios de estado en
+    formato JSON.
+
+  - Comandos (comando): El backend publica instrucciones con acción y
+    parámetros.
+
+  - Sensores (sensor): Lecturas periódicas de sensores (PIR, LDR) en
+    formato JSON.
+
+  - Telemetría (telemetria): Los dispositivos envían RSSI, heap libre
+    y uptime cada 60 segundos.
+
+7.3 Tipos de Dispositivos Soportados
+
+  El firmware incluye 6 templates de dispositivos:
+
+  a) light_switch: Control de LED/relé simple (encendido/apagado/
+     toggle). Pin: 5
+
+  b) multi_sala: Control de 3 zonas (cocina, cuarto, cochera) con
+     comandos individuales y globales (todas_on/todas_off).
+     Pines: 5, 18, 19
+
+  c) garage_door: Control de puerta de garaje con sensores de límite.
+     Pin relé: 2; Pines sensor: 4, 5
+
+  d) blind_motor: Control de persiana motorizada con posicionamiento
+     0-100%. Pines motor: 2, 4; Pin encoder: 5
+
+  e) pir_sensor: Sensor de movimiento PIR con antirrebote. Pin: 2
+
+  f) ldr_sensor: Sensor de luz ambiental LDR con umbral configurable.
+     Pin: A0
+
+7.4 Sistema de Generación de Firmware
+
+  - Endpoint: GET /api/firmware/generate
+  - Parámetros: type, deviceId, ssid, broker, password, clientId
+  - Funcionamiento:
+    1. Lee el archivo base (firmware/base/base.ino) que contiene la
+       lógica común de WiFi, TLS y MQTT.
+    2. Inyecta el template específico del tipo de dispositivo.
+    3. Reemplaza los marcadores: REPLACE_WIFI_SSID, REPLACE_BROKER_IP,
+       REPLACE_WIFI_PASSWORD, REPLACE_DEVICE_ID, REPLACE_CA_CERT.
+    4. Retorna un archivo .ino descargable listo para compilar en
+       Arduino IDE.
+
+  - El certificado CA se inyecta para conexiones TLS seguras; en su
+    ausencia, se configura modo inseguro (desarrollo).
+
+7.5 Control por Voz (Push-to-Talk)
+
+  - Implementado mediante Web Speech Recognition API (SpeechRecognition)
+  - Idioma: Español (México) - es-MX
+  - Parseo NLP basado en alias de habitaciones:
+    * "cocina" / "kitchen"
+    * "cuarto" / "dormitorio" / "habitacion"
+    * "cochera" / "garage"
+  - Soporte de comandos compuestos con "y":
+    Ejemplo: "enciende cocina y cuarto"
+  - Fallback a búsqueda por nombre de dispositivo si no se reconoce
+    la habitación
+  - Los dispositivos multi_sala admiten comandos globales
+    (todas_on / todas_off)
+
+7.6 Detección de Dispositivos Inactivos
+
+  - Tarea programada cada 15 segundos
+  - Marca dispositivos como offline si last_seen supera el umbral
+    (actualmente 15 segundos, hardcodeado)
+  - Los dispositivos deben enviar telemetría periódica para mantener
+    el estado "online"
+
+
+================================================================================
+                   8. DESPLIEGUE Y OPERACIÓN
+================================================================================
+
+8.1 Orquestación de Contenedores
+
+  El sistema se despliega mediante Docker Compose con 4 servicios:
+
+  a) broker (Eclipse Mosquitto):
+     - Puertos expuestos: 1883 (MQTT plano, solo red interna),
+       8883 (MQTT TLS)
+     - Volúmenes: configuración, archivo de contraseñas, ACL,
+       certificados TLS
+     - Health check sobre el puerto 8883
+
+  b) db (PostgreSQL 16 Alpine):
+     - Puerto: 5432 (solo red interna de Docker)
+     - Variables de entorno: POSTGRES_USER, POSTGRES_PASSWORD,
+       POSTGRES_DB
+     - Volumen persistente para datos (pgdata)
+     - Health check con pg_isready
+
+  c) backend (Node.js):
+     - Puerto: 3001 (expuesto al host)
+     - Dependencias: depends_on broker y db
+     - Variables de entorno para configuración y secretos
+     - Multi-stage Dockerfile (node:20-alpine)
+     - Usuario no-root (UID 1001)
+     - Health check sobre /health
+     - Volumen para logs persistentes
+
+  d) frontend (Next.js 14):
+     - Puerto: 3000 (expuesto al host)
+     - Multi-stage Dockerfile (build standalone)
+     - Build args: NEXT_PUBLIC_WIFI_SSID, NEXT_PUBLIC_MQTT_BROKER
+     - Usuario no-root
+     - Sin volúmenes (aplicación estática)
+
+8.2 Redes
+
+  - Red interna: casaiot_internal (bridge)
+  - Los servicios se comunican por nombre de contenedor
+  - Solo los puertos estrictamente necesarios se exponen al host
+
+8.3 Recomendaciones para Producción (PRODUCTION.md)
+
+  - VPN WireGuard para acceso remoto (no reenvío de puertos)
+  - Nginx como proxy inverso con TLS 1.2/1.3
+  - Restricción de dirección IP para el endpoint /metrics
+  - Scripts de backup de base de datos
+  - Escaneo de vulnerabilidades (npm audit, docker scan)
+  - Monitoreo con Prometheus (endpoint /metrics expuesto)
+
+
+================================================================================
+                   9. ÁREAS DE MEJORA DETECTADAS
+================================================================================
+
+  a) Ausencia de pruebas automatizadas:
+     No se encontraron pruebas unitarias, de integración ni de extremo
+     a extremo en el código base. No hay frameworks de testing
+     incluidos en las dependencias.
+
+  b) Autorización basada en roles deshabilitada:
+     El sistema de roles (admin/user/readonly) está definido en la base
+     de datos pero no se enforcea en la mayoría de endpoints.
+
+  c) Rate limiting sin efecto práctico:
+     Los límites de tasa están configurados con valores muy altos,
+     inhabilitando efectivamente la protección contra abusos.
+
+  d) Mosquitto en modo desarrollo:
+     allow_anonymous true y require_certificate comentado en la
+     configuración del broker.
+
+  e) Logs de depuración en código de producción:
+     Instrucciones console.log y debug persistidas en archivos del
+     backend (devices.js, firmware.js).
+
+  f) Sin pipeline de CI/CD:
+     No se detectaron archivos de configuración para integración
+     continua ni despliegue automatizado.
+
+  g) Sin documentación formal de API:
+     No se implementa Swagger/OpenAPI para la documentación de
+     endpoints REST.
+
+  h) Migraciones ad-hoc:
+     Presencia de sentencias ALTER TABLE en tiempo de ejecución en
+     ciertos endpoints (reminders).
+
+  i) Umbral de inactividad hardcodeado:
+     El tiempo de tolerancia para dispositivos inactivos (15 segundos)
+     está fijado en el código sin posibilidad de configuración.
+
+
+================================================================================
+                   10. CONCLUSIONES
+================================================================================
+
+CasaIoT se presenta como una solución de domótica robusta y bien diseñada,
+con una arquitectura de software limpia y modular que sigue principios de
+diseño sólidos y buenas prácticas de seguridad. La elección de un stack
+tecnológico moderno (Node.js, Next.js, PostgreSQL) y la completa
+containerización facilitan su despliegue y mantenimiento.
+
+Fortalezas principales:
+
+  - Arquitectura por capas con separación clara de responsabilidades.
+  - Comunicación en tiempo real mediante WebSocket y MQTT.
+  - Infraestructura PKI completa con soporte para mTLS.
+  - Autenticación robusta con JWT, bcrypt y protección contra timing
+    attacks.
+  - Validación de entradas y consultas parametrizadas contra inyección
+    SQL.
+  - Operación completamente local (on-premise) sin dependencia cloud.
+  - Sistema integrado de generación de firmware para ESP32.
+  - Interfaz de usuario moderna con diseño responsivo y PWA.
+  - Control por voz con reconocimiento de lenguaje natural en español.
+  - Automatización programable mediante cron.
+
+Áreas de atención prioritaria:
+
+  - Implementación de pruebas automatizadas (unitarias, integración, E2E).
+  - Reimplementación del sistema de autorización por roles.
+  - Ajuste de límites de rate limiting para producción.
+  - Configuración de seguridad del broker MQTT para entornos productivos.
+  - Establecimiento de un pipeline CI/CD.
+  - Documentación formal de la API (OpenAPI/Swagger).
+
+En conjunto, CasaIoT constituye una base sólida para un sistema de
+domótica doméstica, con un nivel de sofisticación técnica y de seguridad
+que lo posiciona favorablemente frente a alternativas comerciales y de
+código abierto, requiriendo principalmente mejoras en las áreas de
+testing y hardening para producción.
+
+================================================================================
+                      FIN DEL DOCUMENTO
+================================================================================

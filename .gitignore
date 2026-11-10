@@ -1,0 +1,39 @@
+# ── Secretos (NUNCA subir) ───────────────────────────────────
+.env
+.env.*
+!.env.example
+broker/passwd
+broker/certs/*
+!broker/certs/.gitkeep
+*.key
+*.pem
+*.crt
+*.srl
+*.p12
+*.pfx
+
+# ── Dependencias ─────────────────────────────────────────────
+node_modules/
+
+# ── Builds / artefactos ──────────────────────────────────────
+.next/
+out/
+build/
+dist/
+*.tsbuildinfo
+next-env.d.ts
+
+# ── Logs ─────────────────────────────────────────────────────
+*.log
+logs/
+npm-debug.log*
+
+# ── Sistema / editores ───────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# ── Claude Code (config local por usuario) ───────────────────
+.claude/settings.local.json

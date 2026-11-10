@@ -1,0 +1,33 @@
+# ─────────────────────────────────────────────────────────────
+#  Mosquitto ACL — CasaIoT
+#  Control de acceso por usuario a topics MQTT
+#
+#  Sintaxis:
+#    user <username>
+#    topic read  <topic>    → solo lectura
+#    topic write <topic>    → solo escritura
+#    topic readwrite <topic>→ lectura y escritura
+#
+#  Comodines MQTT:
+#    #  → cualquier subtopic recursivo
+#    +  → un nivel de subtopic
+# ─────────────────────────────────────────────────────────────
+
+# ── Backend (suscripción total, publicación de comandos) ──────
+user backend
+topic readwrite casa/#
+topic readwrite $SYS/#
+
+# ── ESP32 plantilla (los dispositivos reales se agregan por script) ──
+# Patrón: cada dispositivo solo accede a sus propios topics
+# user esp32_<device_id>
+# topic write casa/dispositivo/<device_id>/estado
+# topic write casa/dispositivo/<device_id>/sensor
+# topic write casa/dispositivo/<device_id>/telemetria
+# topic read  casa/dispositivo/<device_id>/comando
+# topic read  casa/dispositivo/<device_id>/ota
+
+# ── Sistema / monitoreo ───────────────────────────────────────
+user monitor
+topic read casa/#
+topic read $SYS/#
