@@ -1,7 +1,8 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
+import { api } from '../../lib/api';
 import { Zap, Eye, EyeOff, UserPlus, LogIn } from 'lucide-react';
 
 export default function LoginPage() {
@@ -12,6 +13,14 @@ export default function LoginPage() {
   const [busy, setBusy] = useState(false);
   const [showPw, setShowPw] = useState(false);
   const [mode, setMode] = useState('login');
+  // El registro público está cerrado por defecto en el backend (ALLOW_REGISTRATION)
+  const [registrationEnabled, setRegistrationEnabled] = useState(false);
+
+  useEffect(() => {
+    api.setupStatus()
+      .then(s => setRegistrationEnabled(Boolean(s.registrationEnabled)))
+      .catch(() => setRegistrationEnabled(false));
+  }, []);
 
   async function handleSubmit(e) {
     e.preventDefault();
@@ -63,7 +72,7 @@ export default function LoginPage() {
             CasaIoT
           </h1>
           <p style={{ fontSize: 'var(--text-sm)', color: 'var(--text-muted)' }}>
-            {mode === 'login' ? 'Inicia sesión para controlar tu hogar' : 'Crea tu cuenta de administrador'}
+            {mode === 'login' ? 'Inicia sesión para controlar tu hogar' : 'Crea tu cuenta'}
           </p>
         </div>
 
@@ -139,14 +148,21 @@ export default function LoginPage() {
           </button>
         </form>
 
-        <div style={{ textAlign: 'center', marginTop: 'var(--space-6)' }}>
-          <button
-            onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError(''); }}
-            style={{ fontSize: 'var(--text-sm)', color: 'var(--accent)', fontWeight: 500 }}
-          >
-            {mode === 'login' ? '¿Primera vez? Crea una cuenta' : '¿Ya tienes cuenta? Inicia sesión'}
-          </button>
-        </div>
+        {registrationEnabled ? (
+          <div style={{ textAlign: 'center', marginTop: 'var(--space-6)' }}>
+            <button
+              type="button"
+              onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError(''); }}
+              style={{ fontSize: 'var(--text-sm)', color: 'var(--accent)', fontWeight: 500 }}
+            >
+              {mode === 'login' ? '¿Primera vez? Crea una cuenta' : '¿Ya tienes cuenta? Inicia sesión'}
+            </button>
+          </div>
+        ) : (
+          <p style={{ textAlign: 'center', marginTop: 'var(--space-6)', fontSize: 'var(--text-sm)', color: 'var(--text-muted)' }}>
+            ¿No tienes cuenta? Pide a un administrador que te la cree.
+          </p>
+        )}
       </div>
     </div>
   );

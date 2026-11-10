@@ -41,7 +41,12 @@ curl -X POST http://localhost:3001/api/setup/create-admin \
   -d '{"username":"admin","password":"Admin@2026!"}'
 ```
 
-O desde el navegador, accede a `http://localhost:3000` y verás una opción de signup.
+Solo funciona si la base de datos no tiene usuarios. Ojo: la migración `002` siembra `admin / admin123`; si existe,
+inicia sesión con él y **cámbiale la contraseña** en Ajustes → Seguridad (el backend avisa en los logs mientras siga igual).
+
+El registro público está cerrado (`ALLOW_REGISTRATION=false`): el resto de cuentas las crea un admin desde Ajustes → Seguridad.
+
+Tras actualizar el código, aplica las migraciones nuevas: `docker compose exec backend npm run migrate`.
 
 ### 5. **Inicia Sesión**
 

@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { useAuth } from '../../context/AuthContext';
-import { useWebSocket } from '../../hooks/useWebSocket';
+import { useWebSocketStatus } from '../../hooks/useWebSocket';
 import { useDevices } from '../../hooks/useDevices';
 import { api } from '../../lib/api';
 import {
@@ -340,7 +340,7 @@ function QuickAccessSection() {
                 }}>
                   <span style={{ fontWeight: '500' }}>{r.title}</span>
                   <span style={{ color: 'var(--text-muted)' }}>
-                    {r.amount && <span style={{ fontWeight: '600', marginRight: 6 }}>${Number(r.amount).toFixed(0)}</span>}
+                    {r.amount != null ? <span style={{ fontWeight: '600', marginRight: 6 }}>${Number(r.amount).toFixed(0)}</span> : null}
                     {new Date(r.due_date).toLocaleDateString('es-MX', { weekday: 'short', day: 'numeric' })}
                   </span>
                 </div>
@@ -399,9 +399,36 @@ function QuickAccessSection() {
   );
 }
 
+// Formateador reutilizable: crear Intl.DateTimeFormat es costoso (js-cache-function-results)
+const CLOCK_FORMAT = new Intl.DateTimeFormat('es-MX', {
+  hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true,
+});
+const CLOCK_STYLE = {
+  fontSize: 'var(--text-4xl)', fontWeight: '300', letterSpacing: '0.02em',
+  color: 'var(--text-primary)', fontVariantNumeric: 'tabular-nums',
+};
+
+/**
+ * Reloj aislado en su propio componente: antes el estado `clock` vivía en
+ * DashboardPage y forzaba a re-renderizar toda la página (clima, eventos,
+ * todas las tarjetas de dispositivos) cada segundo.
+ */
+function LiveClock() {
+  const [clock, setClock] = useState('');
+
+  useEffect(() => {
+    const tick = () => setClock(CLOCK_FORMAT.format(new Date()));
+    tick();
+    const t = setInterval(tick, 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  return <div style={CLOCK_STYLE} suppressHydrationWarning>{clock}</div>;
+}
+
 export default function DashboardPage() {
   const { user } = useAuth();
-  const { connected } = useWebSocket();
+  const { connected } = useWebSocketStatus();
   const { devices, loading: devicesLoading, sendCommand } = useDevices();
   const [health, setHealth] = useState(null);
 
@@ -417,15 +444,6 @@ export default function DashboardPage() {
   const onlineDevices = devices.filter(d => d.is_online).length;
   const totalDevices = devices.length;
   const mqttOk = health?.services?.mqtt === 'ok';
-  const [clock, setClock] = useState('');
-
-  useEffect(() => {
-    const t = setInterval(() => {
-      const now = new Date();
-      setClock(now.toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }));
-    }, 1000);
-    return () => clearInterval(t);
-  }, []);
 
   return (
     <div>
@@ -441,9 +459,7 @@ export default function DashboardPage() {
               {connected ? (mqttOk ? 'Sistema operativo' : 'Broker desconectado') : 'Sin conexión'}
             </div>
           </div>
-          <div style={{ fontSize: 'var(--text-4xl)', fontWeight: '300', letterSpacing: '0.02em', color: 'var(--text-primary)', fontVariantNumeric: 'tabular-nums' }}>
-            {clock}
-          </div>
+          <LiveClock />
         </div>
       </div>
 

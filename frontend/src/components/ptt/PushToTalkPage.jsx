@@ -188,7 +188,7 @@ export default function PushToTalkPage() {
         <>
           <div style={S.statusText}>Listo para comandos de voz</div>
           <div style={S.instructionText}>
-            Mantén presionado para hablar. Ej: "Enciende cocina", "Apaga cocina y cuarto", "Prende todas las luces"
+            Mantén presionado para hablar. Ej: &ldquo;Enciende cocina&rdquo;, &ldquo;Apaga cocina y cuarto&rdquo;, &ldquo;Prende todas las luces&rdquo;
           </div>
         </>
       )}

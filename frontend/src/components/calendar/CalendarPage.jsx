@@ -242,7 +242,7 @@ function EventCard({ ev, onDismiss }) {
             <>
               {cat}
               {det.subtype && ` · ${det.subtype}`}
-              {ev.amount && ` · $${Number(ev.amount).toFixed(2)}`}
+              {ev.amount != null ? ` · $${Number(ev.amount).toFixed(2)}` : null}
               {ev.repeat_type && ev.repeat_type !== 'none' && ` · ↻ ${ev.repeat_type}`}
               {det.person && ` · ${det.person}`}
             </>

@@ -1,12 +1,13 @@
 'use strict';
 
-const express = require('express');
 const crypto = require('crypto');
 const { query } = require('../db/database');
 const logger = require('../utils/logger');
 const { authMiddleware } = require('../middleware/auth');
+const { createRouter } = require('../utils/asyncRouter');
+const { isNonEmptyString, toPositiveInt } = require('../utils/validation');
 
-const router = express.Router();
+const router = createRouter();
 
 router.use(authMiddleware);
 
@@ -27,8 +28,8 @@ router.get('/', async (req, res) => {
 
 router.post('/', async (req, res) => {
   const { name } = req.body;
-  if (!name || name.trim().length === 0) {
-    return res.status(400).json({ error: 'El nombre del token es requerido' });
+  if (!isNonEmptyString(name, 100)) {
+    return res.status(400).json({ error: 'El nombre del token es requerido (máx. 100 caracteres)' });
   }
 
   try {
@@ -57,8 +58,8 @@ router.post('/', async (req, res) => {
 });
 
 router.delete('/:id', async (req, res) => {
-  const tokenId = parseInt(req.params.id, 10);
-  if (isNaN(tokenId)) return res.status(400).json({ error: 'ID inválido' });
+  const tokenId = toPositiveInt(req.params.id);
+  if (!tokenId) return res.status(400).json({ error: 'ID inválido' });
 
   try {
     const { rows } = await query(

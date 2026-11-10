@@ -1,65 +1,90 @@
+// ─────────────────────────────────────────────────────────────
+//  api/config.js — Configuración del sistema (red, región)
+//
+//  GET   /api/config  → cualquier usuario autenticado. La contraseña
+//                       WiFi NUNCA se devuelve: solo `wifi_password_set`.
+//  PATCH /api/config  → solo admin. Un wifi_password vacío conserva el
+//                       valor guardado.
+// ─────────────────────────────────────────────────────────────
+
 'use strict';
 
-const express = require('express');
 const { query } = require('../db/database');
 const logger = require('../utils/logger');
-const { authMiddleware } = require('../middleware/auth');
+const { createRouter } = require('../utils/asyncRouter');
+const { authMiddleware, requireAdmin } = require('../middleware/auth');
+const { isPlainObject, isString, isValidHost } = require('../utils/validation');
 
-const router = express.Router();
-
+const router = createRouter();
 router.use(authMiddleware);
 
-const ALLOWED_KEYS = ['wifi_ssid', 'wifi_password', 'mqtt_broker_ip', 'timezone', 'location'];
+// Validador por clave: devuelve true si el valor es aceptable
+const VALIDATORS = {
+  wifi_ssid:      v => isString(v) && v.length <= 32,
+  wifi_password:  v => isString(v) && v.length <= 64,
+  mqtt_broker_ip: v => v === '' || isValidHost(v),
+  timezone:       v => isString(v) && /^[A-Za-z0-9_/+-]{1,64}$/.test(v),
+  location:       v => isPlainObject(v)
+    && Number.isFinite(v.lat) && Math.abs(v.lat) <= 90
+    && Number.isFinite(v.lng) && Math.abs(v.lng) <= 180
+    && (v.name === undefined || (isString(v.name) && v.name.length <= 100))
+    && (v.source === undefined || (isString(v.source) && v.source.length <= 20))
+    && Object.keys(v).every(k => ['lat', 'lng', 'name', 'source'].includes(k)),
+};
+const ALLOWED_KEYS = Object.keys(VALIDATORS);
 
-// GET /api/config — devuelve solo las claves de red
-router.get('/', async (req, res) => {
-  try {
-    const { rows } = await query(
-      'SELECT key, value FROM system_config WHERE key = ANY($1)',
-      [ALLOWED_KEYS]
-    );
-    const result = {};
-    rows.forEach(r => { result[r.key] = r.value; });
-    res.json(result);
-  } catch (err) {
-    logger.error('Error leyendo config', { error: err.message });
-    res.status(500).json({ error: 'Error al leer configuración' });
+async function readPublicConfig() {
+  const { rows } = await query(
+    'SELECT key, value FROM system_config WHERE key = ANY($1)',
+    [ALLOWED_KEYS]
+  );
+  const result = {};
+  for (const { key, value } of rows) {
+    if (key === 'wifi_password') continue;
+    result[key] = value;
   }
+  const pw = rows.find(r => r.key === 'wifi_password');
+  result.wifi_password_set = Boolean(pw && typeof pw.value === 'string' && pw.value.length > 0);
+  return result;
+}
+
+// GET /api/config
+router.get('/', async (req, res) => {
+  res.json(await readPublicConfig());
 });
 
-// PATCH /api/config — actualiza claves de red
-router.patch('/', async (req, res) => {
+// PATCH /api/config
+router.patch('/', requireAdmin, async (req, res) => {
   const updates = req.body;
+  if (!isPlainObject(updates)) {
+    return res.status(400).json({ error: 'El cuerpo debe ser un objeto' });
+  }
+
   const keys = Object.keys(updates);
-
-  const invalid = keys.filter(k => !ALLOWED_KEYS.includes(k));
-  if (invalid.length > 0) {
-    return res.status(400).json({ error: `Claves inválidas: ${invalid.join(', ')}` });
+  const invalidKeys = keys.filter(k => !ALLOWED_KEYS.includes(k));
+  if (invalidKeys.length > 0) {
+    return res.status(400).json({ error: `Claves inválidas: ${invalidKeys.join(', ').slice(0, 200)}` });
+  }
+  const invalidValues = keys.filter(k => !VALIDATORS[k](updates[k]));
+  if (invalidValues.length > 0) {
+    return res.status(400).json({ error: `Valores inválidos para: ${invalidValues.join(', ')}` });
   }
 
-  try {
-    for (const key of keys) {
-      await query(
-        `INSERT INTO system_config (key, value, updated_at)
-         VALUES ($1, $2::jsonb, NOW())
-         ON CONFLICT (key)
-         DO UPDATE SET value = $2::jsonb, updated_at = NOW()`,
-        [key, JSON.stringify(updates[key])]
-      );
-    }
-    logger.info('Config actualizada', { keys, userId: req.user.userId });
+  // Contraseña vacía = "no cambiar" (el frontend ya no la recibe)
+  const toSave = keys.filter(k => !(k === 'wifi_password' && updates[k] === ''));
 
-    const { rows } = await query(
-      'SELECT key, value FROM system_config WHERE key = ANY($1)',
-      [ALLOWED_KEYS]
+  for (const key of toSave) {
+    await query(
+      `INSERT INTO system_config (key, value, updated_at)
+       VALUES ($1, $2::jsonb, NOW())
+       ON CONFLICT (key)
+       DO UPDATE SET value = $2::jsonb, updated_at = NOW()`,
+      [key, JSON.stringify(updates[key])]
     );
-    const result = {};
-    rows.forEach(r => { result[r.key] = r.value; });
-    res.json(result);
-  } catch (err) {
-    logger.error('Error actualizando config', { error: err.message });
-    res.status(500).json({ error: 'Error al guardar configuración' });
   }
+  logger.info('Config actualizada', { keys: toSave, userId: req.user.userId });
+
+  res.json(await readPublicConfig());
 });
 
 module.exports = router;

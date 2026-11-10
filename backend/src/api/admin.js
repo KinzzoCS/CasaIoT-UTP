@@ -1,60 +1,66 @@
+// ─────────────────────────────────────────────────────────────
+//  api/admin.js — Gestión de usuarios (solo admin)
+//
+//  GET    /api/admin/users
+//  POST   /api/admin/users
+//  PATCH  /api/admin/users/:id   (role, is_active, username)
+//  DELETE /api/admin/users/:id
+// ─────────────────────────────────────────────────────────────
+
 'use strict';
 
-const express = require('express');
 const bcrypt = require('bcrypt');
 const { query } = require('../db/database');
 const logger = require('../utils/logger');
 const config = require('../config');
-const { authMiddleware, requireRole } = require('../middleware/auth');
+const { createRouter } = require('../utils/asyncRouter');
+const { authMiddleware, requireAdmin } = require('../middleware/auth');
+const { isValidUsername, isAcceptablePassword, toPositiveInt } = require('../utils/validation');
+const { revokeAllSessions } = require('../services/sessions');
 
-const router = express.Router();
+const router = createRouter();
 
 router.use(authMiddleware);
-router.use(requireRole('admin'));
+router.use(requireAdmin);
+
+const ROLES = ['admin', 'user', 'readonly'];
+
+router.param('id', (req, res, next, id) => {
+  const n = toPositiveInt(id);
+  if (!n) return res.status(400).json({ error: 'ID inválido' });
+  if (n === req.user.userId) {
+    return res.status(400).json({ error: 'No puedes modificar ni eliminar tu propia cuenta desde aquí' });
+  }
+  req.targetUserId = n;
+  next();
+});
 
 router.get('/users', async (req, res) => {
-  try {
-    const { rows } = await query(`
-      SELECT u.id, u.username, u.role, u.is_active, u.last_login, u.created_at,
-        (SELECT COUNT(*) FROM refresh_tokens rt WHERE rt.user_id = u.id AND rt.revoked = FALSE) AS active_sessions,
-        (SELECT COUNT(*) FROM api_tokens t WHERE t.user_id = u.id) AS api_tokens
-      FROM users u
-      ORDER BY u.created_at DESC
-    `);
-    res.json(rows);
-  } catch (err) {
-    logger.error('Error listando usuarios', { error: err.message });
-    res.status(500).json({ error: 'Error al obtener usuarios' });
-  }
+  const { rows } = await query(`
+    SELECT u.id, u.username, u.role, u.is_active, u.last_login, u.created_at,
+      (SELECT COUNT(*) FROM refresh_tokens rt
+        WHERE rt.user_id = u.id AND rt.revoked = FALSE AND rt.expires_at > NOW()) AS active_sessions,
+      (SELECT COUNT(*) FROM api_tokens t WHERE t.user_id = u.id) AS api_tokens
+    FROM users u
+    ORDER BY u.created_at DESC
+  `);
+  res.json(rows);
 });
 
 router.post('/users', async (req, res) => {
   const { username, password, role } = req.body;
 
-  if (!username || !password) {
-    return res.status(400).json({ error: 'username y password son requeridos' });
+  if (!isValidUsername(username)) {
+    return res.status(400).json({ error: 'Username inválido: 3-50 caracteres, solo letras, números, guiones y guiones bajos' });
   }
-
+  if (!isAcceptablePassword(password)) {
+    return res.status(400).json({ error: 'La contraseña debe tener entre 8 y 128 caracteres' });
+  }
+  const userRole = ROLES.includes(role) ? role : 'user';
   const usernameClean = username.toLowerCase().trim();
-  if (usernameClean.length < 3) {
-    return res.status(400).json({ error: 'El username debe tener al menos 3 caracteres' });
-  }
-  if (password.length < 6) {
-    return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
-  }
 
-  const userRole = (role === 'admin') ? 'admin' : 'user';
-
+  const passwordHash = await bcrypt.hash(password, config.security.bcryptRounds);
   try {
-    const { rows: existing } = await query(
-      'SELECT id FROM users WHERE username = $1',
-      [usernameClean]
-    );
-    if (existing[0]) {
-      return res.status(409).json({ error: 'El nombre de usuario ya existe' });
-    }
-
-    const passwordHash = await bcrypt.hash(password, config.security.bcryptRounds);
     const { rows } = await query(
       `INSERT INTO users (username, password_hash, role)
        VALUES ($1, $2, $3)
@@ -70,95 +76,80 @@ router.post('/users', async (req, res) => {
 
     res.status(201).json(rows[0]);
   } catch (err) {
-    logger.error('Error creando usuario', { error: err.message });
-    res.status(500).json({ error: 'Error al crear usuario' });
+    if (err.code === '23505') return res.status(409).json({ error: 'El nombre de usuario ya existe' });
+    throw err;
   }
 });
 
 router.patch('/users/:id', async (req, res) => {
-  const userId = parseInt(req.params.id, 10);
-  if (isNaN(userId)) return res.status(400).json({ error: 'ID inválido' });
+  const { role, is_active, username } = req.body;
+  const setClauses = [];
+  const values = [];
 
-  if (userId === req.user.userId) {
-    return res.status(400).json({ error: 'No puedes modificarte a ti mismo desde aquí' });
+  if (role !== undefined) {
+    if (!ROLES.includes(role)) return res.status(400).json({ error: `role debe ser uno de: ${ROLES.join(', ')}` });
+    values.push(role);
+    setClauses.push(`role = $${values.length}`);
+  }
+  if (is_active !== undefined) {
+    if (typeof is_active !== 'boolean') return res.status(400).json({ error: 'is_active debe ser booleano' });
+    values.push(is_active);
+    setClauses.push(`is_active = $${values.length}`);
+  }
+  if (username !== undefined) {
+    if (!isValidUsername(username)) return res.status(400).json({ error: 'Username inválido' });
+    values.push(username.toLowerCase().trim());
+    setClauses.push(`username = $${values.length}`);
   }
 
-  const allowed = ['role', 'is_active', 'username'];
-  const updates = {};
-  for (const key of allowed) {
-    if (req.body[key] !== undefined) updates[key] = req.body[key];
-  }
-
-  if (Object.keys(updates).length === 0) {
+  if (setClauses.length === 0) {
     return res.status(400).json({ error: 'No hay campos válidos para actualizar' });
   }
 
+  values.push(req.targetUserId);
+
+  let rows;
   try {
-    const setClauses = [];
-    const values = [];
-    let idx = 1;
-
-    if (updates.role !== undefined) {
-      setClauses.push(`role = $${idx++}`);
-      values.push(updates.role === 'admin' ? 'admin' : 'user');
-    }
-    if (updates.is_active !== undefined) {
-      setClauses.push(`is_active = $${idx++}`);
-      values.push(updates.is_active);
-    }
-    if (updates.username !== undefined) {
-      setClauses.push(`username = $${idx++}`);
-      values.push(updates.username.toLowerCase().trim());
-    }
-
-    values.push(userId);
-
-    const { rows } = await query(
-      `UPDATE users SET ${setClauses.join(', ')} WHERE id = $${idx}
+    ({ rows } = await query(
+      `UPDATE users SET ${setClauses.join(', ')} WHERE id = $${values.length}
        RETURNING id, username, role, is_active, last_login, created_at`,
       values
-    );
-
-    if (!rows[0]) return res.status(404).json({ error: 'Usuario no encontrado' });
-
-    logger.info('Usuario actualizado por admin', {
-      targetUserId: userId,
-      updates,
-      updatedBy: req.user.userId,
-    });
-
-    res.json(rows[0]);
+    ));
   } catch (err) {
-    logger.error('Error actualizando usuario', { error: err.message });
-    res.status(500).json({ error: 'Error al actualizar usuario' });
+    if (err.code === '23505') return res.status(409).json({ error: 'El nombre de usuario ya existe' });
+    throw err;
   }
+
+  if (!rows[0]) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+  // Cambiar rol o desactivar: cerrar sesiones para que el cambio aplique ya
+  // (el access token vigente expira en ≤15 min y no se puede renovar).
+  if (role !== undefined || is_active === false) {
+    await revokeAllSessions(req.targetUserId);
+  }
+
+  logger.info('Usuario actualizado por admin', {
+    targetUserId: req.targetUserId,
+    fields: Object.keys(req.body).filter(k => ['role', 'is_active', 'username'].includes(k)),
+    updatedBy: req.user.userId,
+  });
+
+  res.json(rows[0]);
 });
 
 router.delete('/users/:id', async (req, res) => {
-  const userId = parseInt(req.params.id, 10);
-  if (isNaN(userId)) return res.status(400).json({ error: 'ID inválido' });
+  const { rows } = await query(
+    'DELETE FROM users WHERE id = $1 RETURNING id, username, role',
+    [req.targetUserId]
+  );
+  if (!rows[0]) return res.status(404).json({ error: 'Usuario no encontrado' });
 
-  if (userId === req.user.userId) {
-    return res.status(400).json({ error: 'No puedes eliminarte a ti mismo' });
-  }
+  logger.info('Usuario eliminado por admin', {
+    deletedUser: rows[0].username,
+    deletedById: req.user.userId,
+  });
 
-  try {
-    const { rows } = await query(
-      'DELETE FROM users WHERE id = $1 RETURNING id, username, role',
-      [userId]
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'Usuario no encontrado' });
-
-    logger.info('Usuario eliminado por admin', {
-      deletedUser: rows[0].username,
-      deletedById: req.user.userId,
-    });
-
-    res.json({ message: `Usuario ${rows[0].username} eliminado` });
-  } catch (err) {
-    logger.error('Error eliminando usuario', { error: err.message });
-    res.status(500).json({ error: 'Error al eliminar usuario' });
-  }
+  res.json({ message: `Usuario ${rows[0].username} eliminado` });
 });
 
 module.exports = router;

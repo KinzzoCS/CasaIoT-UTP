@@ -76,6 +76,13 @@ services:
       MQTT_KEY_PATH: /app/certs/backend.key
       # App
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Seguridad
+      ALLOW_REGISTRATION: ${ALLOW_REGISTRATION:-false}
+      AUTH_RATE_LIMIT_MAX: ${AUTH_RATE_LIMIT_MAX:-10}
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-2000}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      DEVICE_OFFLINE_SECONDS: ${DEVICE_OFFLINE_SECONDS:-150}
     volumes:
       - ./broker/certs:/app/certs:ro
       - ./firmware:/app/firmware:ro

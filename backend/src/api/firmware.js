@@ -1,126 +1,114 @@
+// ─────────────────────────────────────────────────────────────
+//  api/firmware.js — Generador de firmware ESP32
+//
+//  POST /api/firmware/generate  (solo admin)
+//    body: { type, deviceId, ssid?, broker?, password? }
+//
+//  Cambios de seguridad:
+//  - Antes era GET y la contraseña WiFi viajaba en la URL (quedaba en
+//    logs, historial y proxies). Ahora va en el body o, si se omite,
+//    se toma de la configuración guardada en el servidor.
+//  - Los valores se escapan como literal de C: un SSID con comillas
+//    ya no puede inyectar código en el .ino generado.
+//  - Solo admin: el archivo resultante contiene la clave WiFi.
+// ─────────────────────────────────────────────────────────────
+
 'use strict';
 
-const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const { query } = require('../db/database');
 const logger = require('../utils/logger');
 const config = require('../config');
-const { authMiddleware } = require('../middleware/auth');
-const { sanitizeString } = require('../utils/validation');
+const { createRouter } = require('../utils/asyncRouter');
+const { authMiddleware, requireAdmin } = require('../middleware/auth');
+const {
+  isValidMqttClientId, isValidHost, isNonEmptyString, isOptionalString, escapeCString,
+} = require('../utils/validation');
 
-const router = express.Router();
+const router = createRouter();
+router.use(authMiddleware, requireAdmin);
 
-// ENDPOINT PROTEGIDO: requiere autenticación (sin restricciones de rol)
-router.get('/generate', authMiddleware, (req, res) => {
-  const { type, deviceId, ssid, broker, password = '' } = req.query;
+// Tipo de dispositivo → plantilla en firmware/templates
+const TEMPLATES = {
+  light: 'light_switch',
+  multi_sala: 'multi_sala',
+  multi_sala_servo: 'multi_sala_servo',
+};
 
-  // Debug: log parámetros recibidos (ocultando password)
-  const debugParams = { type, deviceId: deviceId?.slice(0, 20), ssid, broker: broker?.slice(0, 30), hasPassword: !!password };
-  logger.debug('GET /api/firmware/generate - parámetros', debugParams);
+// En Docker el firmware se monta en /app/firmware; en local está en la raíz del repo.
+const FIRMWARE_DIR = [
+  process.env.FIRMWARE_DIR,
+  path.join(__dirname, '../../firmware'),
+  path.join(__dirname, '../../../firmware'),
+].find(dir => dir && fs.existsSync(path.join(dir, 'base', 'base.ino')));
 
-  // Validaciones estrictas
-  if (!type || !deviceId || !ssid || !broker) {
-    logger.warn('Faltan parámetros requeridos', debugParams);
-    return res.status(400).json({ error: 'Parámetros requeridos faltando: type, deviceId, ssid, broker' });
+async function getStoredNetworkConfig() {
+  const { rows } = await query(
+    `SELECT key, value FROM system_config WHERE key IN ('wifi_ssid', 'wifi_password', 'mqtt_broker_ip')`
+  );
+  return Object.fromEntries(rows.map(r => [r.key, typeof r.value === 'string' ? r.value : '']));
+}
+
+router.post('/generate', async (req, res) => {
+  const { type, deviceId } = req.body;
+
+  if (!Object.prototype.hasOwnProperty.call(TEMPLATES, type)) {
+    return res.status(400).json({ error: `type inválido. Permitidos: ${Object.keys(TEMPLATES).join(', ')}` });
+  }
+  if (!isValidMqttClientId(deviceId)) {
+    return res.status(400).json({ error: 'deviceId inválido' });
+  }
+  if (!isOptionalString(req.body.ssid, 32) || !isOptionalString(req.body.password, 64) || !isOptionalString(req.body.broker, 100)) {
+    return res.status(400).json({ error: 'ssid (máx. 32), broker (máx. 100) o password (máx. 64) inválidos' });
   }
 
-  // Validar tipo de firmware
-  const validTypes = ['light', 'multi_sala', 'multi_sala_servo'];
-  if (!validTypes.includes(type)) {
-    return res.status(400).json({ error: `type inválido. Permitidos: ${validTypes.join(', ')}` });
+  const stored = await getStoredNetworkConfig();
+  const ssid = req.body.ssid || stored.wifi_ssid;
+  const broker = req.body.broker || stored.mqtt_broker_ip;
+  const password = req.body.password || stored.wifi_password || '';
+
+  if (!isNonEmptyString(ssid, 32) || !isValidHost(broker)) {
+    return res.status(400).json({ error: 'Configura el SSID y la IP del broker en Ajustes → Red antes de generar firmware' });
   }
 
-  // Mapear tipo a nombre de archivo
-  const typeMap = {
-    'light': 'light_switch',
-    'multi_sala': 'multi_sala',
-    'multi_sala_servo': 'multi_sala_servo',
-  };
+  if (!FIRMWARE_DIR) {
+    logger.error('Directorio de firmware no encontrado (define FIRMWARE_DIR)');
+    return res.status(500).json({ error: 'Plantillas de firmware no disponibles en el servidor' });
+  }
 
-  // Sanitizar entrada (previene path traversal)
-  const safeDeviceId = sanitizeString(deviceId).slice(0, 100);
-  const safeSsid = sanitizeString(ssid).slice(0, 32);
-  const safeBroker = sanitizeString(broker).slice(0, 100);
-  const safePassword = sanitizeString(password).slice(0, 64);
+  const [baseCode, templateCode] = await Promise.all([
+    fs.promises.readFile(path.join(FIRMWARE_DIR, 'base', 'base.ino'), 'utf8'),
+    fs.promises.readFile(path.join(FIRMWARE_DIR, 'templates', `${TEMPLATES[type]}.ino`), 'utf8'),
+  ]);
 
-  const baseFile = path.join(__dirname, '../../firmware/base/base.ino');
-  const templateFile = path.join(__dirname, `../../firmware/templates/${typeMap[type]}.ino`);
-
-  // Debug: resolver rutas absolutas para verificar
-  logger.debug('Rutas de plantillas resueltas', {
-    __dirname,
-    baseFile,
-    templateFile,
-    cwd: process.cwd(),
-    existsBase: fs.existsSync(baseFile),
-    existsTemplate: fs.existsSync(templateFile),
-  });
-
-  try {
-    if (!fs.existsSync(baseFile) || !fs.existsSync(templateFile)) {
-      const missing = [];
-      if (!fs.existsSync(baseFile)) missing.push('base');
-      if (!fs.existsSync(templateFile)) missing.push('template');
-      logger.error('Archivo(s) de plantilla no encontrado(s)', {
-        missing,
-        baseFile,
-        templateFile,
-        dirname: __dirname,
-        cwd: process.cwd(),
+  // Certificado CA (opcional) para la conexión TLS del ESP32
+  let caCert = '';
+  if (config.mqtt.caPath) {
+    caCert = await fs.promises.readFile(config.mqtt.caPath, 'utf8')
+      .then(c => c.trim())
+      .catch(err => {
+        logger.warn('No se pudo leer el certificado CA', { error: err.message });
+        return '';
       });
-      return res.status(404).json({
-        error: 'Plantilla de firmware no encontrada',
-        detail: `Falta(n): ${missing.join(', ')}`,
-      });
-    }
-
-    let baseCode = fs.readFileSync(baseFile, 'utf8');
-    const templateCode = fs.readFileSync(templateFile, 'utf8');
-
-    // Debug: verificar placeholders antes del reemplazo
-    const placeholders = ['REPLACE_WIFI_SSID', 'REPLACE_BROKER_IP', 'REPLACE_WIFI_PASSWORD', 'REPLACE_DEVICE_ID', 'REPLACE_CA_CERT'];
-    const found = {};
-    placeholders.forEach(p => { found[p] = baseCode.includes(p); });
-    logger.debug('Placeholders en base.ino', found);
-
-    // Leer certificado CA para inyectar en el firmware
-    let caCertContent = '';
-    try {
-      const caPath = config.mqtt.caPath;
-      if (caPath && fs.existsSync(caPath)) {
-        caCertContent = fs.readFileSync(caPath, 'utf8').trim();
-        logger.debug('Certificado CA leído', { path: caPath, size: caCertContent.length });
-      }
-    } catch (caErr) {
-      logger.warn('No se pudo leer el certificado CA', { error: caErr.message });
-    }
-
-    // Reemplazar variables inyectadas (con valores sanitizados)
-    baseCode = baseCode.replace(/"REPLACE_WIFI_SSID"/g, `"${safeSsid}"`);
-    baseCode = baseCode.replace(/"REPLACE_BROKER_IP"/g, `"${safeBroker}"`);
-    baseCode = baseCode.replace(/"REPLACE_WIFI_PASSWORD"/g, `"${safePassword}"`);
-    baseCode = baseCode.replace(/"REPLACE_DEVICE_ID"/g, `"${safeDeviceId}"`);
-    baseCode = baseCode.replace('REPLACE_CA_CERT', caCertContent
-      ? `R"EOF(${caCertContent})EOF"`
-      : '""');
-
-    const finalCode = `
-${baseCode}
-
-// --- LOGICA ESPECIFICA (${type}) ---
-${templateCode}
-`;
-
-    res.setHeader('Content-disposition', `attachment; filename=casaiot_${type}_${safeDeviceId}.ino`);
-    res.setHeader('Content-type', 'text/plain');
-    res.send(finalCode);
-
-    const size = Buffer.byteLength(finalCode, 'utf8');
-    logger.info('Firmware generado correctamente', { type, deviceId: safeDeviceId, sizeBytes: size, userId: req.user.userId });
-  } catch (err) {
-    logger.error('Error generando firmware', { error: err.message, stack: err.stack, type, deviceId });
-    res.status(500).json({ error: 'Error al generar firmware', detail: err.message });
   }
+
+  const code = baseCode
+    .replace(/"REPLACE_WIFI_SSID"/g, `"${escapeCString(ssid)}"`)
+    .replace(/"REPLACE_BROKER_IP"/g, `"${escapeCString(broker)}"`)
+    .replace(/"REPLACE_WIFI_PASSWORD"/g, `"${escapeCString(password)}"`)
+    .replace(/"REPLACE_DEVICE_ID"/g, `"${escapeCString(deviceId)}"`)
+    // El PEM solo contiene base64, guiones y saltos de línea: seguro en raw string
+    .replace('REPLACE_CA_CERT', /^[A-Za-z0-9+/=\s-]*$/.test(caCert) && caCert ? `R"EOF(${caCert})EOF"` : '""');
+
+  const finalCode = `${code}\n\n// --- LOGICA ESPECIFICA (${type}) ---\n${templateCode}\n`;
+
+  res.setHeader('Content-Disposition', `attachment; filename="casaiot_${type}_${deviceId}.ino"`);
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(finalCode);
+
+  logger.info('Firmware generado', { type, deviceId, userId: req.user.userId });
 });
 
 module.exports = router;

@@ -1,72 +1,81 @@
 // ─────────────────────────────────────────────────────────────
 //  api/devices.js — CRUD de dispositivos IoT
 //
-//  GET    /api/devices           → Listar todos
-//  POST   /api/devices           → Registrar nuevo
-//  GET    /api/devices/:id       → Detalle de uno
-//  PATCH  /api/devices/:id       → Actualizar
-//  DELETE /api/devices/:id       → Eliminar
+//  GET    /api/devices             → Listar todos
+//  POST   /api/devices             → Registrar nuevo
+//  GET    /api/devices/:id         → Detalle de uno
+//  PATCH  /api/devices/:id         → Actualizar
+//  DELETE /api/devices/:id         → Eliminar
 //  POST   /api/devices/:id/command → Enviar comando MQTT
 // ─────────────────────────────────────────────────────────────
 
 'use strict';
 
-const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const { query } = require('../db/database');
-const mqttClient = require('../mqtt/client');
 const config = require('../config');
 const logger = require('../utils/logger');
-const { authMiddleware } = require('../middleware/auth');
+const { createRouter } = require('../utils/asyncRouter');
+const { authMiddleware, requireWriter } = require('../middleware/auth');
+const {
+  isValidUUID, isNonEmptyString, isOptionalString, isValidMqttClientId,
+} = require('../utils/validation');
+const { sendDeviceCommand, CommandError, VALID_ACTIONS } = require('../services/deviceCommands');
 
-const router = express.Router();
+const router = createRouter();
 
 // Todos los endpoints requieren autenticación
 router.use(authMiddleware);
 
+// Validar :id una sola vez (antes un id no-UUID provocaba un 500 de PostgreSQL)
+router.param('id', (req, res, next, id) => {
+  if (!isValidUUID(id)) return res.status(400).json({ error: 'ID de dispositivo inválido' });
+  next();
+});
+
+const PUBLIC_COLUMNS = `
+  id, name, type, location, mqtt_client_id,
+  mqtt_topic_base, is_online, last_state,
+  last_seen, firmware_version, created_at
+`;
+
 // ── GET /api/devices ──────────────────────────────────────────
 router.get('/', async (req, res) => {
-  try {
-    const { rows } = await query(`
-      SELECT
-        id, name, type, location, mqtt_client_id,
-        mqtt_topic_base, is_online, last_state,
-        last_seen, firmware_version, created_at
-      FROM devices
-      ORDER BY location, name
-    `);
-    res.json(rows);
-  } catch (err) {
-    logger.error('Error listando dispositivos', { error: err.message });
-    res.status(500).json({ error: 'Error al obtener dispositivos' });
-  }
+  const { rows } = await query(`
+    SELECT ${PUBLIC_COLUMNS}
+    FROM devices
+    WHERE deleted_at IS NULL
+    ORDER BY location, name
+  `);
+  res.json(rows);
 });
 
 // ── GET /api/devices/:id ──────────────────────────────────────
 router.get('/:id', async (req, res) => {
-  try {
-    const { rows } = await query(
-      'SELECT * FROM devices WHERE id = $1',
-      [req.params.id]
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'Dispositivo no encontrado' });
-    res.json(rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: 'Error al obtener dispositivo' });
-  }
+  const { rows } = await query(
+    `SELECT ${PUBLIC_COLUMNS} FROM devices WHERE id = $1 AND deleted_at IS NULL`,
+    [req.params.id]
+  );
+  if (!rows[0]) return res.status(404).json({ error: 'Dispositivo no encontrado' });
+  res.json(rows[0]);
 });
 
 // ── POST /api/devices ─────────────────────────────────────────
-router.post('/', async (req, res) => {
+router.post('/', requireWriter, async (req, res) => {
   const { name, type, location, mqttClientId } = req.body;
 
-  if (!name || !type || !mqttClientId) {
-    return res.status(400).json({ error: 'name, type y mqttClientId son requeridos' });
+  if (!isNonEmptyString(name, 100)) {
+    return res.status(400).json({ error: 'name es requerido (máx. 100 caracteres)' });
   }
-
-  const validTypes = ['light', 'multi_sala', 'multi_sala_servo'];
-  if (!validTypes.includes(type)) {
-    return res.status(400).json({ error: `type debe ser uno de: ${validTypes.join(', ')}` });
+  if (!Object.prototype.hasOwnProperty.call(VALID_ACTIONS, type)) {
+    return res.status(400).json({ error: `type debe ser uno de: ${Object.keys(VALID_ACTIONS).join(', ')}` });
+  }
+  if (!isOptionalString(location, 100)) {
+    return res.status(400).json({ error: 'location debe ser texto (máx. 100 caracteres)' });
+  }
+  // Sin '/', '+', '#': el id forma parte del tópico MQTT
+  if (!isValidMqttClientId(mqttClientId)) {
+    return res.status(400).json({ error: 'mqttClientId inválido: 1-64 caracteres, solo letras, números, guiones y guiones bajos' });
   }
 
   const id = uuidv4();
@@ -76,116 +85,72 @@ router.post('/', async (req, res) => {
     const { rows } = await query(`
       INSERT INTO devices (id, name, type, location, mqtt_client_id, mqtt_topic_base)
       VALUES ($1, $2, $3, $4, $5, $6)
-      RETURNING *
-    `, [id, name, type, location, mqttClientId, topicBase]);
+      RETURNING ${PUBLIC_COLUMNS}
+    `, [id, name.trim(), type, location?.trim() || null, mqttClientId, topicBase]);
 
-    logger.info('Dispositivo registrado', { id, name, type, userId: req.user.userId });
+    logger.info('Dispositivo registrado', { id, name: rows[0].name, type, userId: req.user.userId });
     res.status(201).json(rows[0]);
   } catch (err) {
     if (err.code === '23505') { // unique_violation
       return res.status(409).json({ error: 'Ya existe un dispositivo con ese mqtt_client_id' });
     }
-    logger.error('Error registrando dispositivo', { error: err.message });
-    res.status(500).json({ error: 'Error al registrar dispositivo' });
+    throw err;
   }
 });
 
 // ── PATCH /api/devices/:id ────────────────────────────────────
-router.patch('/:id', async (req, res) => {
+router.patch('/:id', requireWriter, async (req, res) => {
   const { name, location } = req.body;
 
-  try {
-    const { rows } = await query(`
-      UPDATE devices
-      SET
-        name     = COALESCE($1, name),
-        location = COALESCE($2, location)
-      WHERE id = $3
-      RETURNING *
-    `, [name, location, req.params.id]);
-
-    if (!rows[0]) return res.status(404).json({ error: 'Dispositivo no encontrado' });
-    res.json(rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: 'Error al actualizar dispositivo' });
+  if (name !== undefined && !isNonEmptyString(name, 100)) {
+    return res.status(400).json({ error: 'name debe ser texto no vacío (máx. 100 caracteres)' });
   }
+  if (!isOptionalString(location, 100)) {
+    return res.status(400).json({ error: 'location debe ser texto (máx. 100 caracteres)' });
+  }
+
+  const { rows } = await query(`
+    UPDATE devices
+    SET
+      name     = COALESCE($1, name),
+      location = COALESCE($2, location)
+    WHERE id = $3 AND deleted_at IS NULL
+    RETURNING ${PUBLIC_COLUMNS}
+  `, [name?.trim() ?? null, location?.trim() ?? null, req.params.id]);
+
+  if (!rows[0]) return res.status(404).json({ error: 'Dispositivo no encontrado' });
+  res.json(rows[0]);
 });
 
 // ── DELETE /api/devices/:id (eliminación real) ─────────────────
-router.delete('/:id', async (req, res) => {
-  try {
-    const { rowCount } = await query(
-      'DELETE FROM devices WHERE id = $1',
-      [req.params.id]
-    );
-    if (rowCount === 0) return res.status(404).json({ error: 'Dispositivo no encontrado' });
-    logger.info('Dispositivo eliminado', { id: req.params.id, userId: req.user.userId });
-    res.status(204).send();
-  } catch (err) {
-    res.status(500).json({ error: 'Error al eliminar dispositivo' });
-  }
+router.delete('/:id', requireWriter, async (req, res) => {
+  const { rowCount } = await query('DELETE FROM devices WHERE id = $1', [req.params.id]);
+  if (rowCount === 0) return res.status(404).json({ error: 'Dispositivo no encontrado' });
+  logger.info('Dispositivo eliminado', { id: req.params.id, userId: req.user.userId });
+  res.status(204).send();
 });
 
 // ── POST /api/devices/:id/command ─────────────────────────────
-router.post('/:id/command', async (req, res) => {
-  const { action, params = {} } = req.body;
-  logger.info('[DEBUG] POST /api/devices/:id/command', { body: req.body, ip: req.ip });
-
-  if (!action) {
-    return res.status(400).json({ error: 'action es requerido' });
-  }
-
-  const validActions = {
-    light: ['encender', 'apagar', 'toggle'],
-    multi_sala: ['encender', 'apagar', 'toggle', 'todas_on', 'todas_off'],
-    multi_sala_servo: ['encender', 'apagar', 'toggle', 'todas_on', 'todas_off', 'abrir_cochera', 'cerrar_cochera', 'toggle_cochera'],
-  };
+router.post('/:id/command', requireWriter, async (req, res) => {
+  const { action, params } = req.body;
 
   try {
-    // Obtener el dispositivo para validar el action
-    const { rows } = await query(
-      'SELECT id, type, mqtt_client_id, mqtt_topic_base, is_online FROM devices WHERE id = $1',
-      [req.params.id]
-    );
-
-    if (!rows[0]) return res.status(404).json({ error: 'Dispositivo no encontrado' });
-    const device = rows[0];
-    logger.info('[DEBUG] Dispositivo encontrado', { id: device.id, type: device.type, mqttClientId: device.mqtt_client_id });
-
-    const allowed = validActions[device.type] || [];
-    if (allowed.length > 0 && !allowed.includes(action)) {
-      logger.warn('[DEBUG] Acción no válida', { type: device.type, action, allowed });
-      return res.status(400).json({
-        error: `Acción no válida para ${device.type}. Permitidas: ${allowed.join(', ')}`,
-      });
-    }
-
-    // Publicar comando en MQTT
-    const topic = `${device.mqtt_topic_base}/comando`;
-    const payload = {
-      accion: action,
-      ...params,
+    const { topic, payload, published } = await sendDeviceCommand({
+      deviceId: req.params.id,
+      action,
       params,
-      ts: Date.now(),
-      source: 'api',
       userId: req.user.userId,
-    };
+      sourceIp: req.ip,
+      source: 'api',
+    });
 
-    logger.info('[DEBUG] Publicando en MQTT', { topic, payload, mqttConnected: mqttClient.isConnected ? mqttClient.isConnected() : 'unknown' });
-    const published = mqttClient.publish(topic, payload);
-    logger.info('[DEBUG] Resultado publish', { published });
-
-    // Registrar el evento de comando
-    await query(`
-      INSERT INTO events (device_id, event_type, payload, source_ip)
-      VALUES ($1, 'command', $2, $3)
-    `, [device.id, JSON.stringify(payload), req.ip]);
-
-    logger.info('Comando enviado', { deviceId: device.id, action, userId: req.user.userId });
+    if (!published) {
+      return res.status(503).json({ error: 'Broker MQTT no disponible: el comando no se envió', topic });
+    }
     res.json({ message: 'Comando enviado', topic, payload });
   } catch (err) {
-    logger.error('[DEBUG] Error enviando comando', { error: err.message, stack: err.stack });
-    res.status(500).json({ error: 'Error al enviar comando' });
+    if (err instanceof CommandError) return res.status(err.status).json({ error: err.message });
+    throw err;
   }
 });
 

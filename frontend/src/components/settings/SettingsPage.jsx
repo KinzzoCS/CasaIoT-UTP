@@ -192,16 +192,16 @@ function RegionalTab() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
+  // Antes se consultaba ipapi.co en cada visita, enviando la IP pública del
+  // hogar a un tercero sin avisar. La plataforma es local: se usa solo la
+  // configuración guardada y la zona horaria del navegador.
   useEffect(() => {
-    Promise.all([
-      api.getConfig(),
-      fetch('https://ipapi.co/json/').then(r => r.json()).catch(() => ({})),
-    ]).then(([cfg, geo]) => {
+    api.getConfig().then((cfg) => {
       const loc = cfg.location;
       const locObj = typeof loc === 'string' ? (() => { try { return JSON.parse(loc); } catch { return {}; } })() : (loc || {});
-      const name = locObj.name || geo.city || '';
-      const lat = locObj.lat || geo.latitude || '';
-      const lng = locObj.lng || geo.longitude || '';
+      const name = locObj.name || '';
+      const lat = locObj.lat || '';
+      const lng = locObj.lng || '';
       const match = CITIES.find(c => c.name === name);
       setForm({
         timezone: cfg.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/Mexico_City',
@@ -329,7 +329,11 @@ function RegionalTab() {
 }
 
 function NetworkTab() {
+  const { user } = useAuth();
+  const isAdmin = user?.role === 'admin';
+  // La contraseña WiFi nunca llega al navegador: el campo vacío = "no cambiar"
   const [form, setForm] = useState({ wifi_ssid: '', wifi_password: '', mqtt_broker_ip: '' });
+  const [passwordSet, setPasswordSet] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -338,16 +342,19 @@ function NetworkTab() {
     api.getConfig().then(data => {
       setForm({
         wifi_ssid: data.wifi_ssid || '',
-        wifi_password: data.wifi_password || '',
+        wifi_password: '',
         mqtt_broker_ip: data.mqtt_broker_ip || '',
       });
+      setPasswordSet(Boolean(data.wifi_password_set));
     }).catch(() => {}).finally(() => setLoading(false));
   }, []);
 
   async function handleSave() {
     setSaving(true);
     try {
-      await api.updateConfig(form);
+      const data = await api.updateConfig(form);
+      setPasswordSet(Boolean(data.wifi_password_set));
+      setForm(p => ({ ...p, wifi_password: '' }));
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (err) {
@@ -379,7 +386,9 @@ function NetworkTab() {
           </div>
           <div>
             <label style={S.label}>Contraseña WiFi</label>
-            <input style={S.input} type="password" placeholder="Contraseña" value={form.wifi_password}
+            <input style={S.input} type="password" autoComplete="new-password"
+              placeholder={passwordSet ? '•••••••• (guardada — escribe para cambiarla)' : 'Contraseña'}
+              value={form.wifi_password} disabled={!isAdmin}
               onChange={e => setForm(p => ({ ...p, wifi_password: e.target.value }))} />
           </div>
           <div>
@@ -388,14 +397,20 @@ function NetworkTab() {
               onChange={e => setForm(p => ({ ...p, mqtt_broker_ip: e.target.value }))} />
           </div>
         </div>
-        <button onClick={handleSave} disabled={saving} style={{
-          ...S.btn(saved ? 'var(--color-success)' : 'var(--accent)'),
-          marginTop: 'var(--space-4)',
-          opacity: saving ? 0.6 : 1,
-        }}>
-          {saved ? <Check size={16} /> : <Save size={16} />}
-          {saving ? 'Guardando...' : saved ? 'Guardado' : 'Guardar configuración de red'}
-        </button>
+        {isAdmin ? (
+          <button onClick={handleSave} disabled={saving} style={{
+            ...S.btn(saved ? 'var(--color-success)' : 'var(--accent)'),
+            marginTop: 'var(--space-4)',
+            opacity: saving ? 0.6 : 1,
+          }}>
+            {saved ? <Check size={16} /> : <Save size={16} />}
+            {saving ? 'Guardando...' : saved ? 'Guardado' : 'Guardar configuración de red'}
+          </button>
+        ) : (
+          <p style={{ marginTop: 'var(--space-4)', fontSize: 'var(--text-sm)', color: 'var(--text-muted)' }}>
+            Solo un administrador puede cambiar la configuración de red.
+          </p>
+        )}
       </div>
     </div>
   );
@@ -772,7 +787,7 @@ function LegalTab() {
           <h3 style={{ margin: '16px 0 8px', fontSize: 'var(--text-base)' }}>1. Exención de responsabilidad</h3>
           <p style={{ marginBottom: '12px', color: 'var(--text-secondary)' }}>
             CasaIoT es un sistema de automatización del hogar diseñado para uso personal y educativo. 
-            El software se proporciona "tal cual", sin garantía de ningún tipo, expresa o implícita, 
+            El software se proporciona &ldquo;tal cual&rdquo;, sin garantía de ningún tipo, expresa o implícita, 
             incluyendo pero no limitándose a las garantías de funcionamiento ininterrumpido, 
             seguridad absoluta o ausencia de errores.
           </p>

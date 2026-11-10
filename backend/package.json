@@ -10,7 +10,8 @@
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
     "migrate": "node src/db/migrate.js",
-    "lint": "eslint src/"
+    "lint": "eslint src/",
+    "test:smoke": "node scripts/smoke-test.js"
   },
   "dependencies": {
     "bcrypt": "^5.1.1",

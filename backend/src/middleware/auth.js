@@ -12,6 +12,14 @@ const config = require('../config');
 const logger = require('../utils/logger');
 
 /**
+ * Verifica un access token. Fija el algoritmo para impedir
+ * ataques de confusión de algoritmo.
+ */
+function verifyAccessToken(token) {
+  return jwt.verify(token, config.jwt.secret, { algorithms: [config.jwt.algorithm] });
+}
+
+/**
  * Middleware JWT — requiere token válido en Authorization header.
  * Uso: router.get('/protected', authMiddleware, handler)
  */
@@ -25,8 +33,7 @@ function authMiddleware(req, res, next) {
   const token = authHeader.slice(7); // Remover "Bearer "
 
   try {
-    const decoded = jwt.verify(token, config.jwt.secret);
-    req.user = decoded;
+    req.user = verifyAccessToken(token);
     next();
   } catch (err) {
     if (err.name === 'TokenExpiredError') {
@@ -59,4 +66,10 @@ function requireRole(...roles) {
   };
 }
 
-module.exports = { authMiddleware, requireRole };
+// Atajos de uso común
+// - requireAdmin: configuración de red, firmware (contiene la clave WiFi), usuarios
+// - requireWriter: cualquier escritura; bloquea solo al rol 'readonly'
+const requireAdmin = requireRole('admin');
+const requireWriter = requireRole('admin', 'user');
+
+module.exports = { authMiddleware, requireRole, requireAdmin, requireWriter, verifyAccessToken };

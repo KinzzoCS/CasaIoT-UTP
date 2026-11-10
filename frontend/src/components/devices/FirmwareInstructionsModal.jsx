@@ -319,7 +319,7 @@ export default function FirmwareInstructionsModal({ isOpen, deviceName, deviceTy
                 <strong>📚 Librerías requeridas:</strong> Antes de compilar, instala desde
                 Sketch → Include Library → Manage Libraries:
                 <ol style={{ marginTop: '8px', paddingLeft: '20px' }}>
-                  <li><strong>PubSubClient</strong> de Nick O'Leary</li>
+                  <li><strong>PubSubClient</strong> de Nick O&apos;Leary</li>
                   <li><strong>ArduinoJson</strong> de Benoit Blanchon</li>
                 </ol>
               </div>
@@ -345,7 +345,7 @@ export default function FirmwareInstructionsModal({ isOpen, deviceName, deviceTy
                   Click en Upload (Ctrl+U o botón flecha)
                 </li>
                 <li style={{ color: 'var(--text-secondary)', fontSize: 'var(--text-sm)' }}>
-                  Espera a que diga "Done uploading"
+                  Espera a que diga &ldquo;Done uploading&rdquo;
                 </li>
               </ol>
             </div>

@@ -1,74 +1,67 @@
 // ─────────────────────────────────────────────────────────────
 //  api/auth.js — Endpoints de autenticación
 //
-//  POST /api/auth/login      → Devuelve JWT + refresh token
-//  POST /api/auth/refresh    → Renueva JWT usando refresh token
-//  POST /api/auth/logout     → Revoca refresh token
-//  GET  /api/auth/me         → Info del usuario actual
+//  POST  /api/auth/register  → Crea usuario (solo si ALLOW_REGISTRATION=true)
+//  POST  /api/auth/login     → Devuelve JWT + refresh token
+//  POST  /api/auth/refresh   → Rota el refresh token y emite nuevo JWT
+//  POST  /api/auth/logout    → Revoca refresh token
+//  PATCH /api/auth/password  → Cambia contraseña y revoca otras sesiones
+//  GET   /api/auth/me        → Info del usuario actual
 // ─────────────────────────────────────────────────────────────
 
 'use strict';
 
-const express = require('express');
 const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
-const crypto = require('crypto');
 const { query } = require('../db/database');
 const config = require('../config');
 const logger = require('../utils/logger');
+const { createRouter } = require('../utils/asyncRouter');
 const { authMiddleware } = require('../middleware/auth');
 const { authLimiter } = require('../middleware/rateLimiter');
+const { isValidUsername, isAcceptablePassword, isString } = require('../utils/validation');
+const { hashToken, issueSession, revokeAllSessions } = require('../services/sessions');
 
-const router = express.Router();
+const router = createRouter();
+
+// Hash real calculado una vez: comparar contra un hash malformado
+// devolvía al instante y revelaba si el usuario existía (timing attack).
+const DUMMY_HASH = bcrypt.hashSync('casaiot-dummy-password', config.security.bcryptRounds);
+
+const PASSWORD_RULE = 'La contraseña debe tener entre 8 y 128 caracteres';
 
 // ── POST /api/auth/register ───────────────────────────────────
-// Crea un usuario. Si es el primer usuario del sistema, se asigna rol 'admin'.
+// Registro público deshabilitado por defecto: con los roles relajados,
+// cualquier persona en la red podía crearse una cuenta y controlar la casa.
 router.post('/register', authLimiter, async (req, res) => {
-  const { username, password } = req.body;
+  if (!config.security.allowRegistration) {
+    return res.status(403).json({ error: 'El registro público está deshabilitado. Pide a un administrador que cree tu cuenta.' });
+  }
 
-  if (!username || !password) {
-    return res.status(400).json({ error: 'username y password son requeridos' });
+  const { username, password } = req.body;
+  if (!isValidUsername(username)) {
+    return res.status(400).json({ error: 'Username inválido: 3-50 caracteres, solo letras, números, guiones y guiones bajos' });
+  }
+  if (!isAcceptablePassword(password)) {
+    return res.status(400).json({ error: PASSWORD_RULE });
   }
 
   const usernameClean = username.toLowerCase().trim();
-  if (usernameClean.length < 3) {
-    return res.status(400).json({ error: 'El username debe tener al menos 3 caracteres' });
-  }
-  if (password.length < 6) {
-    return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
-  }
+  const passwordHash = await bcrypt.hash(password, config.security.bcryptRounds);
 
   try {
-    // Verificar si ya existe el usuario
-    const { rows: existing } = await query(
-      'SELECT id FROM users WHERE username = $1',
-      [usernameClean]
-    );
-    if (existing[0]) {
-      return res.status(409).json({ error: 'El nombre de usuario ya existe' });
-    }
-
-    // El primer usuario del sistema se convierte en admin automáticamente
-    const { rows: count } = await query('SELECT COUNT(*) as total FROM users');
-    const role = parseInt(count[0].total, 10) === 0 ? 'admin' : 'user';
-
-    const passwordHash = await bcrypt.hash(password, config.security.bcryptRounds);
     const { rows } = await query(
       `INSERT INTO users (username, password_hash, role)
-       VALUES ($1, $2, $3)
+       VALUES ($1, $2, 'user')
        RETURNING id, username, role, created_at`,
-      [usernameClean, passwordHash, role]
+      [usernameClean, passwordHash]
     );
-
-    logger.info('Usuario registrado', { userId: rows[0].id, username: usernameClean, role });
-
-    res.status(201).json({
-      message: 'Usuario creado exitosamente',
-      user: rows[0],
-    });
+    logger.info('Usuario registrado', { userId: rows[0].id, username: usernameClean });
+    res.status(201).json({ message: 'Usuario creado exitosamente', user: rows[0] });
   } catch (err) {
-    logger.error('Error en registro', { error: err.message });
-    res.status(500).json({ error: 'Error interno del servidor' });
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'El nombre de usuario ya existe' });
+    }
+    throw err;
   }
 });
 
@@ -76,114 +69,73 @@ router.post('/register', authLimiter, async (req, res) => {
 router.post('/login', authLimiter, async (req, res) => {
   const { username, password } = req.body;
 
-  if (!username || !password) {
+  if (!isString(username) || !isString(password) || !username || !password) {
     return res.status(400).json({ error: 'username y password son requeridos' });
   }
 
-  try {
-    // Buscar usuario activo
-    const { rows } = await query(
-      'SELECT id, username, password_hash, role FROM users WHERE username = $1 AND is_active = TRUE',
-      [username.toLowerCase().trim()]
-    );
+  const usernameClean = username.toLowerCase().trim().slice(0, 50);
+  const { rows } = await query(
+    'SELECT id, username, password_hash, role FROM users WHERE username = $1 AND is_active = TRUE',
+    [usernameClean]
+  );
+  const user = rows[0];
 
-    const user = rows[0];
+  // Comparar siempre contra un hash real (tiempo constante exista o no el usuario)
+  const passwordMatch = await bcrypt.compare(password.slice(0, 128), user ? user.password_hash : DUMMY_HASH);
 
-    // Comparar contraseña — siempre comparamos (previene timing attacks)
-    const passwordMatch = user
-      ? await bcrypt.compare(password, user.password_hash)
-      : await bcrypt.compare(password, '$2b$12$invalidhashtopreventtiming');
-
-    if (!user || !passwordMatch) {
-      logger.warn('Intento de login fallido', { username, ip: req.ip });
-      return res.status(401).json({ error: 'Credenciales inválidas' });
-    }
-
-    // Actualizar last_login
-    await query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id]);
-
-    // Generar access token (15 min)
-    const accessToken = jwt.sign(
-      { userId: user.id, username: user.username, role: user.role },
-      config.jwt.secret,
-      { expiresIn: config.jwt.accessExpiresIn }
-    );
-
-    // Generar refresh token (7 días, guardado hasheado en DB)
-    const refreshTokenRaw = crypto.randomBytes(64).toString('hex');
-    const refreshTokenHash = crypto.createHash('sha256').update(refreshTokenRaw).digest('hex');
-    const refreshExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-
-    await query(
-      'INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)',
-      [user.id, refreshTokenHash, refreshExpiry]
-    );
-
-    logger.info('Login exitoso', { userId: user.id, username: user.username });
-
-    res.json({
-      accessToken,
-      refreshToken: refreshTokenRaw,
-      expiresIn: 15 * 60, // segundos
-      user: { id: user.id, username: user.username, role: user.role },
-    });
-  } catch (err) {
-    logger.error('Error en login', { error: err.message });
-    res.status(500).json({ error: 'Error interno del servidor' });
+  if (!user || !passwordMatch) {
+    logger.warn('Intento de login fallido', { username: usernameClean, ip: req.ip });
+    return res.status(401).json({ error: 'Credenciales inválidas' });
   }
+
+  await query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id]);
+  const session = await issueSession(user);
+
+  logger.info('Login exitoso', { userId: user.id, username: user.username });
+  res.json({
+    ...session,
+    user: { id: user.id, username: user.username, role: user.role },
+  });
 });
 
 // ── POST /api/auth/refresh ────────────────────────────────────
-router.post('/refresh', async (req, res) => {
+// Rotación: el refresh token usado se revoca y se entrega uno nuevo.
+// El UPDATE ... RETURNING es atómico: dos usos simultáneos del mismo
+// token no pueden ganar ambos.
+router.post('/refresh', authLimiter, async (req, res) => {
   const { refreshToken } = req.body;
-
-  if (!refreshToken) {
+  if (!isString(refreshToken) || refreshToken.length === 0 || refreshToken.length > 256) {
     return res.status(400).json({ error: 'refreshToken es requerido' });
   }
 
-  try {
-    const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
+  const { rows } = await query(`
+    UPDATE refresh_tokens rt
+    SET revoked = TRUE
+    FROM users u
+    WHERE rt.token_hash = $1
+      AND rt.revoked = FALSE
+      AND rt.expires_at > NOW()
+      AND u.id = rt.user_id
+      AND u.is_active = TRUE
+    RETURNING u.id, u.username, u.role
+  `, [hashToken(refreshToken)]);
 
-    // Buscar refresh token válido y no revocado
-    const { rows } = await query(`
-      SELECT rt.id, rt.user_id, u.username, u.role
-      FROM refresh_tokens rt
-      JOIN users u ON u.id = rt.user_id
-      WHERE rt.token_hash = $1
-        AND rt.revoked = FALSE
-        AND rt.expires_at > NOW()
-        AND u.is_active = TRUE
-    `, [tokenHash]);
-
-    if (!rows[0]) {
-      return res.status(401).json({ error: 'Refresh token inválido o expirado' });
-    }
-
-    const { user_id: userId, username, role } = rows[0];
-
-    // Emitir nuevo access token
-    const accessToken = jwt.sign(
-      { userId, username, role },
-      config.jwt.secret,
-      { expiresIn: config.jwt.accessExpiresIn }
-    );
-
-    res.json({ accessToken, expiresIn: 15 * 60 });
-  } catch (err) {
-    logger.error('Error en refresh', { error: err.message });
-    res.status(500).json({ error: 'Error interno del servidor' });
+  if (!rows[0]) {
+    return res.status(401).json({ error: 'Refresh token inválido o expirado' });
   }
+
+  const session = await issueSession(rows[0]);
+  res.json(session);
 });
 
 // ── POST /api/auth/logout ─────────────────────────────────────
 router.post('/logout', authMiddleware, async (req, res) => {
   const { refreshToken } = req.body;
 
-  if (refreshToken) {
-    const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
+  if (isString(refreshToken) && refreshToken.length <= 256) {
     await query(
-      'UPDATE refresh_tokens SET revoked = TRUE WHERE token_hash = $1',
-      [tokenHash]
+      'UPDATE refresh_tokens SET revoked = TRUE WHERE token_hash = $1 AND user_id = $2',
+      [hashToken(refreshToken), req.user.userId]
     );
   }
 
@@ -192,43 +144,43 @@ router.post('/logout', authMiddleware, async (req, res) => {
 });
 
 // ── PATCH /api/auth/password ──────────────────────────────────
-router.patch('/password', authMiddleware, async (req, res) => {
+// Revoca todas las sesiones (incluidas las de otros dispositivos) y
+// devuelve una sesión nueva para el dispositivo actual.
+router.patch('/password', authMiddleware, authLimiter, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
 
-  if (!currentPassword || !newPassword) {
-    return res.status(400).json({ error: 'currentPassword y newPassword son requeridos' });
+  if (!isString(currentPassword) || !currentPassword) {
+    return res.status(400).json({ error: 'currentPassword es requerido' });
+  }
+  if (!isAcceptablePassword(newPassword)) {
+    return res.status(400).json({ error: PASSWORD_RULE });
   }
 
-  if (newPassword.length < 6) {
-    return res.status(400).json({ error: 'La nueva contraseña debe tener al menos 6 caracteres' });
+  const { rows } = await query(
+    'SELECT id, username, role, password_hash FROM users WHERE id = $1 AND is_active = TRUE',
+    [req.user.userId]
+  );
+  const user = rows[0];
+  if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+  const match = await bcrypt.compare(currentPassword.slice(0, 128), user.password_hash);
+  if (!match) {
+    return res.status(401).json({ error: 'La contraseña actual no es correcta' });
   }
 
-  try {
-    const { rows } = await query(
-      'SELECT password_hash FROM users WHERE id = $1',
-      [req.user.userId]
-    );
+  const newHash = await bcrypt.hash(newPassword, config.security.bcryptRounds);
+  await query('UPDATE users SET password_hash = $1 WHERE id = $2', [newHash, user.id]);
+  await revokeAllSessions(user.id);
+  const session = await issueSession(user);
 
-    const match = await bcrypt.compare(currentPassword, rows[0].password_hash);
-    if (!match) {
-      return res.status(401).json({ error: 'La contraseña actual no es correcta' });
-    }
-
-    const newHash = await bcrypt.hash(newPassword, config.security.bcryptRounds);
-    await query('UPDATE users SET password_hash = $1 WHERE id = $2', [newHash, req.user.userId]);
-
-    logger.info('Contraseña actualizada', { userId: req.user.userId });
-    res.json({ message: 'Contraseña actualizada exitosamente' });
-  } catch (err) {
-    logger.error('Error actualizando contraseña', { error: err.message });
-    res.status(500).json({ error: 'Error al actualizar contraseña' });
-  }
+  logger.info('Contraseña actualizada', { userId: user.id });
+  res.json({ message: 'Contraseña actualizada exitosamente', ...session });
 });
 
 // ── GET /api/auth/me ──────────────────────────────────────────
 router.get('/me', authMiddleware, async (req, res) => {
   const { rows } = await query(
-    'SELECT id, username, role, email, last_login, created_at FROM users WHERE id = $1',
+    'SELECT id, username, role, email, last_login, created_at FROM users WHERE id = $1 AND is_active = TRUE',
     [req.user.userId]
   );
   if (!rows[0]) return res.status(404).json({ error: 'Usuario no encontrado' });

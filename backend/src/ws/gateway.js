@@ -15,10 +15,16 @@
 'use strict';
 
 const { WebSocketServer } = require('ws');
-const jwt = require('jsonwebtoken');
 const config = require('../config');
 const logger = require('../utils/logger');
 const mqttClient = require('../mqtt/client');
+const { verifyAccessToken } = require('../middleware/auth');
+const { sendDeviceCommand, CommandError } = require('../services/deviceCommands');
+
+// Tamaño máximo de un mensaje entrante (el default de `ws` es 100 MB)
+const MAX_PAYLOAD_BYTES = 16 * 1024;
+// Código de cierre propio: el frontend renueva el token y reconecta
+const CLOSE_TOKEN_EXPIRED = 4001;
 
 // Mapa de clientes conectados: clientId → WebSocket
 const clients = new Map();
@@ -32,6 +38,7 @@ function init(server) {
     server,
     // Path dedicado para WS (permite coexistir con API REST en el mismo puerto)
     path: '/ws',
+    maxPayload: MAX_PAYLOAD_BYTES,
     // Verificar autenticación antes de aceptar la conexión
     verifyClient: verifyJWT,
   });
@@ -52,6 +59,13 @@ function init(server) {
  *   Opción B: Query param '?token=<jwt>'              (más compatible con browsers)
  */
 function verifyJWT(info, callback) {
+  // Origen: además del JWT, aceptar solo orígenes de la lista CORS
+  const origin = info.origin || info.req.headers.origin;
+  if (origin && !config.security.allowedOrigins.includes(origin)) {
+    logger.warn('Conexión WS rechazada: origen no permitido', { origin });
+    return callback(false, 403, 'Forbidden');
+  }
+
   const url = new URL(info.req.url, 'http://localhost');
   const token = url.searchParams.get('token') ||
     (info.req.headers.authorization || '').replace('Bearer ', '');
@@ -62,7 +76,7 @@ function verifyJWT(info, callback) {
   }
 
   try {
-    const decoded = jwt.verify(token, config.jwt.secret);
+    const decoded = verifyAccessToken(token);
     // Adjuntar datos del usuario al request para usarlos en onConnection
     info.req.user = decoded;
     callback(true);
@@ -95,8 +109,17 @@ function onConnection(ws, req) {
     },
   });
 
-  ws.on('message', (data) => onMessage(ws, user, data));
+  // Cerrar la conexión cuando expire el JWT: antes una sesión revocada o
+  // un usuario desactivado seguía recibiendo eventos y enviando comandos.
+  const msUntilExpiry = user.exp ? user.exp * 1000 - Date.now() : 0;
+  const expiryTimer = setTimeout(() => {
+    ws.close(CLOSE_TOKEN_EXPIRED, 'Token expirado');
+  }, Math.max(msUntilExpiry, 0));
+
+  const ip = req.socket.remoteAddress;
+  ws.on('message', (data) => onMessage(ws, user, data, ip));
   ws.on('close', () => {
+    clearTimeout(expiryTimer);
     clients.delete(clientId);
     logger.info('Cliente WS desconectado', { clientId });
   });
@@ -114,7 +137,7 @@ function onConnection(ws, req) {
  * Procesa mensajes entrantes desde el frontend.
  * El frontend puede enviar comandos que se publican en MQTT.
  */
-function onMessage(ws, user, data) {
+function onMessage(ws, user, data, ip) {
   let message;
   try {
     message = JSON.parse(data);
@@ -122,46 +145,52 @@ function onMessage(ws, user, data) {
     send(ws, { type: 'error', error: 'Formato JSON inválido' });
     return;
   }
+  if (!message || typeof message !== 'object') {
+    send(ws, { type: 'error', error: 'Mensaje inválido' });
+    return;
+  }
 
   logger.debug('Mensaje WS recibido', { type: message.type, userId: user.userId });
 
   switch (message.type) {
     case 'command':
-      handleCommand(ws, user, message);
+      handleCommand(ws, user, message, ip);
       break;
     case 'ping':
       send(ws, { type: 'pong', ts: Date.now() });
       break;
     default:
-      send(ws, { type: 'error', error: `Tipo de mensaje desconocido: ${message.type}` });
+      send(ws, { type: 'error', error: 'Tipo de mensaje desconocido' });
   }
 }
 
 /**
- * Procesa un comando del frontend y lo publica en MQTT.
- * Ejemplo: { type: 'command', deviceId: 'abc', action: 'encender' }
+ * Procesa un comando del frontend con las mismas reglas que la API REST
+ * (dispositivo existente, acción válida, params saneados, rol con escritura).
+ * Ejemplo: { type: 'command', deviceId: '<uuid>', action: 'encender' }
  */
-function handleCommand(ws, user, message) {
-  const { deviceId, action, params = {} } = message;
+async function handleCommand(ws, user, message, ip) {
+  const { deviceId, action, params } = message;
 
-  if (!deviceId || !action) {
-    send(ws, { type: 'error', error: 'deviceId y action son requeridos' });
+  if (user.role === 'readonly') {
+    send(ws, { type: 'error', error: 'Permisos insuficientes' });
     return;
   }
 
-  const topic = `${config.mqtt.baseTopic}/dispositivo/${deviceId}/comando`;
-  const payload = { accion: action, params, ts: Date.now(), source: 'frontend' };
-
-  const published = mqttClient.publish(topic, payload);
-  send(ws, {
-    type: 'command_ack',
-    deviceId,
-    action,
-    published,
-    ts: Date.now(),
-  });
-
-  logger.info('Comando enviado desde frontend', { deviceId, action, userId: user.userId });
+  try {
+    const { published } = await sendDeviceCommand({
+      deviceId, action, params, userId: user.userId, sourceIp: ip, source: 'websocket',
+    });
+    send(ws, { type: 'command_ack', deviceId, action, published, ts: Date.now() });
+  } catch (err) {
+    if (!(err instanceof CommandError)) {
+      logger.error('Error enviando comando por WS', { error: err.message, userId: user.userId });
+    }
+    send(ws, {
+      type: 'error',
+      error: err instanceof CommandError ? err.message : 'Error al enviar comando',
+    });
+  }
 }
 
 /**

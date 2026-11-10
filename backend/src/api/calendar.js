@@ -1,16 +1,18 @@
 'use strict';
 
-const express = require('express');
 const { query } = require('../db/database');
 const { authMiddleware } = require('../middleware/auth');
 const logger = require('../utils/logger');
+const { createRouter } = require('../utils/asyncRouter');
+const { clampInt } = require('../utils/validation');
 
-const router = express.Router();
+const router = createRouter();
 router.use(authMiddleware);
 
 router.get('/', async (req, res) => {
-  const year  = parseInt(req.query.year, 10)  || new Date().getFullYear();
-  const month = parseInt(req.query.month, 10) || new Date().getMonth() + 1;
+  const now   = new Date();
+  const year  = clampInt(req.query.year, 2000, 2100, now.getFullYear());
+  const month = clampInt(req.query.month, 1, 12, now.getMonth() + 1);
 
   const startDate = `${year}-${String(month).padStart(2, '0')}-01`;
   const endDate = month === 12

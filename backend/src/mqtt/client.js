@@ -97,7 +97,7 @@ function onMessage(topic, message) {
   try {
     payload = JSON.parse(message.toString());
   } catch {
-    logger.warn('Mensaje MQTT no es JSON válido', { topic, message: message.toString() });
+    logger.warn('Mensaje MQTT no es JSON válido', { topic, bytes: message.length });
     return;
   }
 

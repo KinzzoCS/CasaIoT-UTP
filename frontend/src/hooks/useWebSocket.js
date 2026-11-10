@@ -1,152 +1,160 @@
 'use client';
 
 // ─────────────────────────────────────────────────────────────
-//  hooks/useWebSocket.js — Hook de conexión WebSocket
+//  hooks/useWebSocket.js — Conexión WebSocket compartida
 //
-//  Maneja el ciclo de vida completo de la conexión WS:
-//  - Conectar con JWT
-//  - Reconexión automática con backoff exponencial
-//  - Despacho de eventos a listeners registrados
-//  - Ping/pong para mantener conexión viva
+//  Una sola conexión para toda la app (singleton de módulo):
+//  - Autenticación con JWT (query param)
+//  - Reconexión con backoff exponencial + jitter
+//  - Si el servidor cierra por token expirado (4001) o rechaza el
+//    handshake, se renueva el token antes de reconectar
+//  - Listeners por tipo de mensaje (useWebSocketEvent)
+//
+//  Buenas prácticas aplicadas:
+//  - useWebSocketStatus solo re-renderiza cuando cambia el estado de
+//    conexión, no con cada mensaje (rerender-defer-reads).
+//  - useSyncExternalStore para suscribirse al store externo.
 // ─────────────────────────────────────────────────────────────
 
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { WS_URL, getAccessToken } from '../lib/api';
+import { useEffect, useRef, useSyncExternalStore } from 'react';
+import { WS_URL, getAccessToken, refreshAccessToken } from '../lib/api';
 
 const MAX_RECONNECT_DELAY = 30000;  // 30 segundos máximo
 const BASE_RECONNECT_DELAY = 1000;  // 1 segundo inicial
+const CLOSE_TOKEN_EXPIRED = 4001;   // ver backend/src/ws/gateway.js
 
-// Singleton para el WebSocket (compartido entre componentes)
 let wsInstance = null;
-let listeners = new Set();
 let reconnectTimeout = null;
 let reconnectAttempts = 0;
-let connectionState = 'disconnected'; // 'connecting', 'connected', 'disconnected'
-let stateListeners = new Set();
+let manuallyClosed = false;
+let connectionState = 'disconnected'; // 'connecting' | 'connected' | 'disconnected'
 
-function notifyStateChange(state) {
+const messageListeners = new Set();
+const stateListeners = new Set();
+
+function setState(state) {
+  if (state === connectionState) return;
   connectionState = state;
-  stateListeners.forEach(fn => fn(state));
+  stateListeners.forEach(fn => fn());
+}
+
+function scheduleReconnect({ refreshFirst }) {
+  const delay = Math.min(BASE_RECONNECT_DELAY * 2 ** reconnectAttempts, MAX_RECONNECT_DELAY)
+    + Math.random() * 1000;
+  reconnectAttempts++;
+  reconnectTimeout = setTimeout(async () => {
+    reconnectTimeout = null;
+    if (refreshFirst) {
+      try {
+        await refreshAccessToken();
+      } catch {
+        // Sin tokens = la sesión terminó (AuthContext muestra el login).
+        // Con tokens = fallo de red: seguir reintentando con backoff.
+        if (getAccessToken()) scheduleReconnect({ refreshFirst: false });
+        return;
+      }
+    }
+    connect();
+  }, refreshFirst ? 0 : delay);
 }
 
 function connect() {
   const token = getAccessToken();
   if (!token) {
-    notifyStateChange('disconnected');
+    setState('disconnected');
     return;
   }
+  if (wsInstance && (wsInstance.readyState === WebSocket.CONNECTING || wsInstance.readyState === WebSocket.OPEN)) return;
 
-  if (wsInstance && wsInstance.readyState === WebSocket.CONNECTING) return;
+  manuallyClosed = false;
+  setState('connecting');
 
-  notifyStateChange('connecting');
+  const ws = new WebSocket(`${WS_URL}/ws?token=${encodeURIComponent(token)}`);
+  let opened = false;
+  wsInstance = ws;
 
-  // Pasar token como query param (compatible con todos los browsers)
-  wsInstance = new WebSocket(`${WS_URL}/ws?token=${encodeURIComponent(token)}`);
-
-  wsInstance.onopen = () => {
+  ws.onopen = () => {
+    opened = true;
     reconnectAttempts = 0;
-    notifyStateChange('connected');
+    setState('connected');
   };
 
-  wsInstance.onmessage = (event) => {
-    try {
-      const data = JSON.parse(event.data);
-      listeners.forEach(fn => fn(data));
-    } catch {
-      // Mensaje no JSON, ignorar
-    }
+  ws.onmessage = (event) => {
+    let data;
+    try { data = JSON.parse(event.data); } catch { return; }
+    messageListeners.forEach(fn => fn(data));
   };
 
-  wsInstance.onclose = (event) => {
-    notifyStateChange('disconnected');
-    wsInstance = null;
+  ws.onclose = (event) => {
+    if (wsInstance === ws) wsInstance = null;
+    setState('disconnected');
+    if (manuallyClosed || event.code === 1000) return;
 
-    // No reconectar si fue cierre limpio (ej: logout)
-    if (event.code === 1000) return;
-
-    // Backoff exponencial con jitter
-    const delay = Math.min(
-      BASE_RECONNECT_DELAY * Math.pow(2, reconnectAttempts),
-      MAX_RECONNECT_DELAY
-    ) + Math.random() * 1000;
-
-    reconnectAttempts++;
-    reconnectTimeout = setTimeout(connect, delay);
-  };
-
-  wsInstance.onerror = () => {
-    // onclose se disparará después, no hacer nada extra aquí
+    // 4001 = token expirado. Un cierre sin haber abierto suele ser un 401
+    // del handshake: probar a renovar el token una vez antes del backoff.
+    const refreshFirst = event.code === CLOSE_TOKEN_EXPIRED || (!opened && reconnectAttempts === 0);
+    scheduleReconnect({ refreshFirst });
   };
 }
 
-function disconnect() {
+/** Cierra la conexión (logout). No reintenta. */
+export function disconnectWebSocket() {
+  manuallyClosed = true;
   if (reconnectTimeout) {
     clearTimeout(reconnectTimeout);
     reconnectTimeout = null;
   }
+  reconnectAttempts = 0;
   if (wsInstance) {
     wsInstance.close(1000, 'Logout');
     wsInstance = null;
   }
-  notifyStateChange('disconnected');
+  setState('disconnected');
 }
 
-function sendMessage(message) {
-  if (wsInstance && wsInstance.readyState === WebSocket.OPEN) {
+export function sendMessage(message) {
+  if (wsInstance?.readyState === WebSocket.OPEN) {
     wsInstance.send(JSON.stringify(message));
     return true;
   }
   return false;
 }
 
-function sendBinary(data) {
-  if (wsInstance && wsInstance.readyState === WebSocket.OPEN) {
-    wsInstance.send(data);
-    return true;
-  }
-  return false;
+function subscribeState(callback) {
+  stateListeners.add(callback);
+  return () => stateListeners.delete(callback);
 }
+const getState = () => connectionState;
+const getServerState = () => 'disconnected';
 
-// ── Hook React ────────────────────────────────────────────────
-export function useWebSocket() {
-  const [connected, setConnected] = useState(connectionState === 'connected');
-  const [lastMessage, setLastMessage] = useState(null);
+// ── Hooks ─────────────────────────────────────────────────────
+
+/** Estado de la conexión. Abre la conexión si aún no existe. */
+export function useWebSocketStatus() {
+  const state = useSyncExternalStore(subscribeState, getState, getServerState);
 
   useEffect(() => {
-    // Suscribirse a cambios de estado de conexión
-    const stateHandler = (state) => setConnected(state === 'connected');
-    stateListeners.add(stateHandler);
-
-    // Suscribirse a mensajes
-    const messageHandler = (data) => setLastMessage(data);
-    listeners.add(messageHandler);
-
-    // Iniciar conexión si no existe
-    if (!wsInstance || wsInstance.readyState === WebSocket.CLOSED) {
-      connect();
-    }
-
-    return () => {
-      stateListeners.delete(stateHandler);
-      listeners.delete(messageHandler);
-    };
+    if (!wsInstance && !reconnectTimeout) connect();
   }, []);
 
-  return { connected, lastMessage, sendMessage, sendBinary, connect, disconnect };
+  return { connected: state === 'connected', state };
 }
 
-// ── Hook con filtro de tipo de mensaje ────────────────────────
+/**
+ * Escucha mensajes de un tipo concreto. El callback se guarda en un ref,
+ * así que puede cambiar en cada render sin re-suscribirse.
+ */
 export function useWebSocketEvent(eventType, callback) {
   const callbackRef = useRef(callback);
-  callbackRef.current = callback;
+  useEffect(() => {
+    callbackRef.current = callback;
+  });
 
   useEffect(() => {
     const handler = (data) => {
-      if (data.type === eventType) {
-        callbackRef.current(data);
-      }
+      if (data.type === eventType) callbackRef.current(data);
     };
-    listeners.add(handler);
-    return () => listeners.delete(handler);
+    messageListeners.add(handler);
+    return () => messageListeners.delete(handler);
   }, [eventType]);
 }

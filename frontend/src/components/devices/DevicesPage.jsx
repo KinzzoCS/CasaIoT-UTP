@@ -5,13 +5,17 @@
 // ─────────────────────────────────────────────────────────────
 
 import { useState } from 'react';
+import dynamic from 'next/dynamic';
 import { useDevices } from '../../hooks/useDevices';
 import { api } from '../../lib/api';
-import FirmwareInstructionsModal from './FirmwareInstructionsModal';
-import { 
-  Power, AlertCircle, Wifi, WifiOff, 
+import {
+  Power, AlertCircle, Wifi, WifiOff,
   Lightbulb, Trash2, Plus, Check, X, Loader, Home, Download
 } from 'lucide-react';
+
+// El modal de instrucciones (~500 líneas) solo se usa tras crear un
+// dispositivo: se carga bajo demanda (bundle-dynamic-imports).
+const FirmwareInstructionsModal = dynamic(() => import('./FirmwareInstructionsModal'), { ssr: false });
 
 const S = {
   section: { marginBottom: 'var(--space-8)' },
@@ -98,21 +102,13 @@ const S = {
   }),
 };
 
-async function downloadFirmware(mqttClientId, type, ssid, broker, wifiPassword = '') {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
-  const token = typeof window !== 'undefined' ? localStorage.getItem('casaiot_access_token') : null;
-  if (!token) { alert('Error: No hay sesión activa'); return; }
-
+/**
+ * Descarga el .ino generado por el backend. La contraseña WiFi la inyecta
+ * el servidor desde Ajustes → Red: ya no pasa por el navegador ni por la URL.
+ */
+async function downloadFirmware(mqttClientId, type, ssid, broker) {
   try {
-    const url = `${baseUrl}/api/firmware/generate?type=${type}&deviceId=${mqttClientId}&ssid=${encodeURIComponent(ssid)}&broker=${encodeURIComponent(broker)}&password=${encodeURIComponent(wifiPassword)}`;
-    const res = await fetch(url, {
-      headers: { 'Authorization': `Bearer ${token}` },
-    });
-    if (!res.ok) {
-      const errData = await res.json().catch(() => ({ error: 'Error desconocido al descargar firmware' }));
-      throw new Error(errData.error || `HTTP ${res.status}`);
-    }
-    const blob = await res.blob();
+    const blob = await api.downloadFirmware({ type, deviceId: mqttClientId, ssid, broker });
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
     link.download = `casaiot_${type}_${mqttClientId}.ino`;
@@ -451,8 +447,8 @@ function NewDeviceForm({ onAdd, onDeviceCreated }) {
         mqttClientId: mqttClientId,
       });
 
-      // Obtener config de red desde la API
-      let netConfig = { wifi_ssid: '', wifi_password: '', mqtt_broker_ip: '' };
+      // Obtener config de red desde la API (sin contraseña WiFi)
+      let netConfig = { wifi_ssid: '', mqtt_broker_ip: '' };
       try {
         netConfig = await api.getConfig();
       } catch {
@@ -476,8 +472,7 @@ function NewDeviceForm({ onAdd, onDeviceCreated }) {
         device.mqtt_client_id,
         device.type,
         netConfig.wifi_ssid || process.env.NEXT_PUBLIC_WIFI_SSID || 'TuSSID',
-        netConfig.mqtt_broker_ip || process.env.NEXT_PUBLIC_MQTT_BROKER || '192.168.1.100',
-        netConfig.wifi_password || ''
+        netConfig.mqtt_broker_ip || process.env.NEXT_PUBLIC_MQTT_BROKER || '192.168.1.100'
       );
 
       // Mostrar modal con instrucciones
@@ -634,8 +629,7 @@ export default function DevicesPage() {
         device.mqtt_client_id,
         device.type,
         netConfig.wifi_ssid || process.env.NEXT_PUBLIC_WIFI_SSID || 'TuSSID',
-        netConfig.mqtt_broker_ip || process.env.NEXT_PUBLIC_MQTT_BROKER || '192.168.1.100',
-        netConfig.wifi_password || ''
+        netConfig.mqtt_broker_ip || process.env.NEXT_PUBLIC_MQTT_BROKER || '192.168.1.100'
       );
     } catch {
       alert('No se pudo obtener la configuración de red. Configúrala en Ajustes primero.');
@@ -648,20 +642,14 @@ export default function DevicesPage() {
   }
 
   async function handleMultiSalaToggle(deviceId, sala, encender) {
-    console.log('[DEBUG] handleMultiSalaToggle', { deviceId, sala, encender });
     try {
       if (sala === 'todas') {
-        const action = encender ? 'todas_on' : 'todas_off';
-        console.log('[DEBUG] sendCommand (todas)', { action });
-        await sendCommand(deviceId, action);
+        await sendCommand(deviceId, encender ? 'todas_on' : 'todas_off');
       } else {
-        const action = encender ? 'encender' : 'apagar';
-        console.log('[DEBUG] sendCommand (sala)', { action, sala });
-        await sendCommand(deviceId, action, { sala });
+        await sendCommand(deviceId, encender ? 'encender' : 'apagar', { sala });
       }
-      console.log('[DEBUG] sendCommand OK');
     } catch (err) {
-      console.error('[DEBUG] Error en comando multi-sala:', err);
+      alert(`No se pudo enviar el comando: ${err.message}`);
     }
   }
 

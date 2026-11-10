@@ -4,6 +4,9 @@
 //  Usamos JSON estructurado en producción para facilitar
 //  parseo por herramientas como Loki, Datadog o grep simple.
 //  En desarrollo, formato legible con colores.
+//
+//  Nivel mínimo configurable con LOG_LEVEL (error|warn|info|debug).
+//  Por defecto: 'info' en producción, 'debug' en desarrollo.
 // ─────────────────────────────────────────────────────────────
 
 'use strict';
@@ -19,6 +22,8 @@ const COLORS = {
   reset: '\x1b[0m',
 };
 
+const minLevel = LEVELS[config.server.logLevel] ?? LEVELS.info;
+
 function formatDev(level, message, meta) {
   const color = COLORS[level] || '';
   const reset = COLORS.reset;
@@ -30,15 +35,18 @@ function formatDev(level, message, meta) {
 }
 
 function formatProd(level, message, meta) {
+  // meta primero: no puede sobrescribir ts/level/msg
   return JSON.stringify({
+    ...meta,
     ts: new Date().toISOString(),
     level,
     msg: message,
-    ...meta,
   });
 }
 
 function log(level, message, meta = {}) {
+  if (LEVELS[level] > minLevel) return;
+
   const output = config.server.isDev
     ? formatDev(level, message, meta)
     : formatProd(level, message, meta);

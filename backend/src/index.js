@@ -14,14 +14,16 @@
 'use strict';
 
 const http = require('http');
+const crypto = require('crypto');
 const express = require('express');
 const helmet = require('helmet');
 const cron = require('node-cron');
+const bcrypt = require('bcrypt');
 
 const config = require('./config');
 const logger = require('./utils/logger');
 const metrics = require('./utils/metrics');
-const { healthCheck } = require('./db/database');
+const { healthCheck, query } = require('./db/database');
 const wsGateway = require('./ws/gateway');
 const mqttClient = require('./mqtt/client');
 const { routeMessage, markStaleDevicesOffline } = require('./mqtt/handlers');
@@ -93,12 +95,26 @@ app.get('/health', async (req, res) => {
       },
     });
   } catch (err) {
-    res.status(503).json({ status: 'error', error: err.message });
+    logger.error('Health check falló', { error: err.message });
+    res.status(503).json({ status: 'error' });
   }
 });
 
 // ── Metrics Prometheus ────────────────────────────────────────
+// Solo desde localhost o con `Authorization: Bearer <METRICS_TOKEN>`.
+function canReadMetrics(req) {
+  const ip = req.socket.remoteAddress || '';
+  if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') return true;
+  const expected = config.security.metricsToken;
+  const given = (req.headers.authorization || '').replace(/^Bearer /, '');
+  if (!expected || !given) return false;
+  const a = Buffer.from(given);
+  const b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
 app.get('/metrics', (req, res) => {
+  if (!canReadMetrics(req)) return res.status(404).json({ error: 'Endpoint no encontrado' });
   res.setHeader('Content-Type', 'text/plain');
   res.send(metrics.getMetricsText());
 });
@@ -122,10 +138,41 @@ app.use((req, res) => {
 });
 
 // Error handler global
+// Respeta los errores 4xx de body-parser (JSON malformado, cuerpo > 10kb)
+// y nunca devuelve detalles internos al cliente.
 app.use((err, req, res, next) => {
-  logger.error('Error no manejado', { error: err.message, stack: err.stack });
-  res.status(500).json({ error: 'Error interno del servidor' });
+  const status = Number.isInteger(err.status) && err.status >= 400 && err.status < 500 ? err.status : 500;
+  if (status === 500) {
+    logger.error('Error no manejado', { error: err.message, stack: err.stack, path: req.path });
+    return res.status(500).json({ error: 'Error interno del servidor' });
+  }
+  const messages = {
+    400: 'Petición malformada',
+    413: 'El cuerpo de la petición es demasiado grande',
+  };
+  res.status(status).json({ error: messages[status] || 'Petición inválida' });
 });
+
+/**
+ * Avisa en los logs si algún admin conserva la contraseña sembrada por la
+ * migración 002 (admin/admin123). No bloquea el arranque.
+ */
+async function warnIfDefaultAdminPassword() {
+  try {
+    const { rows } = await query(
+      `SELECT username, password_hash FROM users WHERE role = 'admin' AND is_active = TRUE`
+    );
+    for (const u of rows) {
+      if (await bcrypt.compare('admin123', u.password_hash)) {
+        logger.warn('SEGURIDAD: el admin usa la contraseña por defecto. Cámbiala en Ajustes → Seguridad.', {
+          username: u.username,
+        });
+      }
+    }
+  } catch (err) {
+    logger.debug('No se pudo comprobar la contraseña por defecto', { error: err.message });
+  }
+}
 
 // ── Inicialización ────────────────────────────────────────────
 async function start() {
@@ -152,11 +199,13 @@ async function start() {
   // 4. Registrar handler de mensajes MQTT
   mqttClient.addHandler(routeMessage);
 
+  warnIfDefaultAdminPassword();
+
   // 5. Job periódico: marcar dispositivos inactivos como offline
-  // Ejecuta cada 15 segundos
+  // Revisa cada 15 s; umbral configurable (DEVICE_OFFLINE_SECONDS, def. 150 s)
   cron.schedule('*/15 * * * * *', async () => {
     try {
-      await markStaleDevicesOffline(15);
+      await markStaleDevicesOffline(config.devices.offlineThresholdSeconds);
     } catch (err) {
       logger.error('Error en job de dispositivos offline', { error: err.message });
     }
@@ -194,9 +243,14 @@ process.on('uncaughtException', (err) => {
   process.exit(1);
 });
 
+// Las rutas ya reenvían sus errores a Express (utils/asyncRouter.js).
+// Si aun así se escapa una promesa, se registra sin tumbar el servidor:
+// antes cualquier request que provocara un rechazo apagaba el backend.
 process.on('unhandledRejection', (reason) => {
-  logger.error('Promise rechazado sin manejar', { reason: String(reason) });
-  process.exit(1);
+  logger.error('Promise rechazado sin manejar', {
+    reason: reason instanceof Error ? reason.message : String(reason),
+    stack: reason instanceof Error ? reason.stack : undefined,
+  });
 });
 
 start();

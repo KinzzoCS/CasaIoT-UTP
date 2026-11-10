@@ -9,7 +9,7 @@
 
 import { useState, useEffect } from 'react';
 import { Home, CalendarDays, Mic, Settings, Zap, Cpu, LogOut, User } from 'lucide-react';
-import { useWebSocket } from '../../hooks/useWebSocket';
+import { useWebSocketStatus } from '../../hooks/useWebSocket';
 import { useAuth } from '../../context/AuthContext';
 import { useDevices } from '../../hooks/useDevices';
 import { usePushToTalk } from '../../hooks/usePushToTalk';
@@ -23,7 +23,7 @@ const tabItems = [
 ];
 
 export default function Navigation({ activeTab, onTabChange, pageTitle }) {
-  const { connected } = useWebSocket();
+  const { connected } = useWebSocketStatus();
   const { user, logout } = useAuth();
   const { devices, sendCommand } = useDevices();
   const { isListening, transcript, results, isSupported, startListening, stopListening, clearResults } = usePushToTalk(devices, sendCommand);
