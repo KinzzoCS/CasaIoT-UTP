@@ -76,6 +76,7 @@ frontend/                Next.js 14 App Router, React 18, JavaScript (JSX, sin T
   src/context/           AuthContext, DevicesContext (estado de dispositivos compartido)
   src/styles/globals.css Design system "Nothing Edition" con variables CSS (sin Tailwind)
 docs/AUDITORIA.md        Auditoría de seguridad y funcionamiento (2026-11-10)
+TAREAS_PENDIENTES.md     Lista de trabajo pendiente (T1-T13) con criterios de "listo"
 firmware/
   base/base.ino          WiFi + TLS + MQTT comunes; marcadores REPLACE_*
   templates/*.ino        Lógica por tipo de dispositivo (se inyecta en base.ino)
@@ -178,9 +179,10 @@ Si tocas una ruta, añade su caso a `backend/scripts/smoke-test.js`. No hay test
 
 ## 7. Cómo trabajar (flujo para agentes)
 
-1. Lee `MEMORY.md` (estado, decisiones, pendientes).
+1. Lee `MEMORY.md` (estado, decisiones) y `TAREAS_PENDIENTES.md` (qué falta y en qué orden).
 2. Localiza el código afectado con la sección 3; sigue los patrones del archivo vecino más parecido.
 3. Haz cambios pequeños y enfocados; no reformatees archivos completos.
 4. Verifica (sección 4). Si no pudiste verificar algo, dilo explícitamente.
-5. Actualiza `MEMORY.md`: añade una línea a la bitácora y mueve/actualiza pendientes, decisiones o bugs.
+5. Actualiza `MEMORY.md` (una línea en la bitácora; decisiones o bugs nuevos) y marca la tarea en `TAREAS_PENDIENTES.md`.
+   El equipo hace commits directos a `main`, **sin pull requests**.
 6. Si cambias comandos, estructura o convenciones, actualiza también este `AGENTS.md`.

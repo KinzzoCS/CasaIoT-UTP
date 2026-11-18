@@ -15,7 +15,9 @@ Memoria viva del proyecto para humanos y agentes. Las reglas y convenciones esta
 
 - Versión 1.0.0. Stack funcionando con Docker Compose: Mosquitto + PostgreSQL 16 + backend Node/Express + frontend Next.js 14.
 - Secciones de la UI: Inicio (dashboard), Dispositivos, Calendario, Push To Talk, Ajustes.
-- Repositorio git (rama `main`) con remoto **privado** en GitHub `KinzzoCS/CasaIoT`. `.gitignore` excluye `.env`, `broker/passwd`,
+- Repositorio git (rama `main`). Repo de trabajo del equipo: **privado** en GitHub `KinzzoCS/CasaIoT-UTP` (remoto `origin`,
+  desde 2026-11-17). El repo anterior `KinzzoCS/CasaIoT` queda como remoto `anterior` y ya no se actualiza.
+  Flujo del equipo: commits directos a `main`, sin pull requests. `.gitignore` excluye `.env`, `broker/passwd`,
   todo `broker/certs/` (solo se versiona `.gitkeep`), `*.key/*.crt/*.pem`, `node_modules/`, `.next/` y `*.log`.
   Tras clonar hay que regenerar certificados (`scripts/generate-certs.ps1`) y crear `.env` desde `.env.example`.
 - Skills de agentes instaladas en `.claude/skills/` y `.agents/skills/` (lock en `skills-lock.json`): find-skills, frontend-design,
@@ -24,6 +26,8 @@ Memoria viva del proyecto para humanos y agentes. Las reglas y convenciones esta
   infraestructura pendientes (broker y TLS del ESP32).
 - Pruebas: `npm run test:smoke` en backend (BD/MQTT simulados, 18 casos). Sin tests contra PostgreSQL real, sin CI, sin OpenAPI.
 - **Pendiente de desplegar**: tras actualizar hay que correr `docker compose exec backend npm run migrate` (migración 003).
+- Trabajo pendiente repartible en [TAREAS_PENDIENTES.md](TAREAS_PENDIENTES.md) (T1-T13). Esa es la lista que se mantiene;
+  la sección "Deuda técnica" de abajo es el resumen.
 
 ## Decisiones vigentes
 
@@ -76,3 +80,4 @@ Revisados el 2026-11-10 (detalle en docs/AUDITORIA.md):
 | 2026-11-10 | Claude (agente) | Análisis del proyecto; se crean `AGENTS.md`, `MEMORY.md` y `CLAUDE.md`. Se detectan schedules sin ejecutor y tipos de dispositivo limitados. |
 | 2026-11-10 | Claude (agente) | `.gitignore`, `git init` y repo privado `KinzzoCS/CasaIoT` en GitHub. Revisión de secretos antes del primer commit: sin `.env`, claves ni certificados. |
 | 2026-11-10 | Claude (agente) | Auditoría (`docs/AUDITORIA.md`). Backend: router async seguro, secretos JWT obligatorios, registro cerrado, rotación de refresh, rate limiting, clave WiFi fuera de respuestas/URLs, firmware por POST con escape C, servicio único de comandos (REST+WS), validación de inputs, roles admin/readonly, migración 003, ESLint y `test:smoke`. Frontend (skill Vercel): DevicesContext, `useWebSocketStatus`, reloj aislado, pestañas con `next/dynamic`, `next/font`, sin `ipapi.co`. Verificado con smoke test, `next build` y navegador contra backend con BD simulada; **no** probado con PostgreSQL/Mosquitto reales. |
+| 2026-11-17 | Claude (agente) | Auditoría integrada en `main` (sin PR). Nuevo repo privado `KinzzoCS/CasaIoT-UTP` como `origin`. Se crea `TAREAS_PENDIENTES.md` para traspasar el trabajo a un compañero. Detectado: `pir_sensor.ino` publica en `/estado` y la alerta de movimiento del backend espera `/sensor` (T5). |
