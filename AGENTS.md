@@ -166,7 +166,7 @@ Si tocas una ruta, añade su caso a `backend/scripts/smoke-test.js`. No hay test
 ## 6. Seguridad — reglas para agentes
 
 - **Nunca** leas, imprimas, copies ni subas el contenido de `.env`, `broker/passwd` ni `broker/certs/*.key`. Usa `.env.example` como referencia.
-- El repo es **privado** en GitHub. Antes de cada commit revisa `git status`: nunca fuerces (`git add -f`) archivos ignorados
+- El repo es **público** en GitHub (desde 2026-11-26). Antes de cada commit revisa `git status`: nunca fuerces (`git add -f`) archivos ignorados
   como `.env`, `broker/passwd` o `broker/certs/*`. Si un secreto llega a un commit, avisa al usuario para rotarlo.
 - No expongas puertos nuevos en `docker-compose.yml` sin justificarlo (la DB no se expone a propósito).
 - La contraseña WiFi nunca sale del servidor: `GET /api/config` solo devuelve `wifi_password_set`, y el firmware se
